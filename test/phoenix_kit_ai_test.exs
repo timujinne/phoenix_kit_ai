@@ -1,6 +1,9 @@
 defmodule PhoenixKitAITest do
   use ExUnit.Case
 
+  alias Ecto.Adapters.SQL.Sandbox
+  alias PhoenixKitAI.Test.Repo, as: TestRepo
+
   # These tests verify that the module correctly implements the
   # PhoenixKit.Module behaviour.
 
@@ -33,17 +36,38 @@ defmodule PhoenixKitAITest do
       assert name == "AI"
     end
 
-    test "enabled?/0 returns a boolean" do
-      # In test env without DB, this returns false (the rescue fallback)
-      assert is_boolean(PhoenixKitAI.enabled?())
-    end
-
     test "enable_system/0 is exported" do
       assert function_exported?(PhoenixKitAI, :enable_system, 0)
     end
 
     test "disable_system/0 is exported" do
       assert function_exported?(PhoenixKitAI, :disable_system, 0)
+    end
+  end
+
+  describe "enabled?/0 (integration)" do
+    @describetag :integration
+
+    # `assert is_boolean(PhoenixKitAI.enabled?())` used to stand in for this
+    # test — it passes for `true` AND `false`, so it can't fail no matter
+    # what the underlying setting is (or whether the database is even
+    # reachable). Assert the actual round-trip against the real setting
+    # instead, the same way `PhoenixKitAI.CoverageTest` pins
+    # `disable_system/0` + `enable_system/0` — this describe exists to keep
+    # the callback-conformance coverage here self-contained rather than
+    # relying on that other file.
+    setup context do
+      pid = Sandbox.start_owner!(TestRepo, shared: not context[:async])
+      on_exit(fn -> Sandbox.stop_owner(pid) end)
+      :ok
+    end
+
+    test "round-trips true then false via enable_system/0 and disable_system/0" do
+      assert {:ok, _} = PhoenixKitAI.enable_system()
+      assert PhoenixKitAI.enabled?() == true
+
+      assert {:ok, _} = PhoenixKitAI.disable_system()
+      assert PhoenixKitAI.enabled?() == false
     end
   end
 

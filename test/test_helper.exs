@@ -1,11 +1,31 @@
 # Test helper for PhoenixKitAI test suite
 #
 # Level 1: Unit tests (schemas, changesets, pure functions) always run.
-# Level 2: Integration tests require PostgreSQL — automatically excluded
-#          when the database is unavailable.
+# Level 2: Integration tests need a real PostgreSQL database — most of the
+#          suite (~550 of ~910 tests), since `PhoenixKitAI.DataCase` and
+#          `PhoenixKitAI.LiveCase` both tag every test they template
+#          `:integration`.
 #
-# To enable integration tests:
-#   createdb phoenix_kit_ai_test
+# `mix test` provisions its own database automatically: the `test:` alias
+# in mix.exs runs `ecto.create --quiet` first, same contract as any
+# standard Phoenix app. If the database is still unusable after that —
+# unreachable host, wrong credentials, migrations that fail — THIS FILE
+# MUST ABORT THE RUN with a nonzero exit. It must NOT print a warning and
+# quietly exclude the `:integration` tag: that turns "the database is
+# broken" into "358 tests, 0 failures" and nobody notices for months (see
+# the incident this rewrite fixes — the old fail-soft below caught every
+# exception/exit from a dead connection pool, downgraded it to a `false`
+# flag, and dropped 551 tests while reporting success).
+#
+# The ONLY sanctioned way to run without a database is the explicit,
+# off-by-default opt-in below:
+#
+#   PK_AI_SKIP_DB=1 mix test
+#
+# for a contributor machine that genuinely has no Postgres and only wants
+# the ~360 pure-unit tests. CI and the standard local/precommit workflow
+# must never set this — a database failure there means something is
+# actually broken and the run should go red.
 
 # Elixir 1.19's `mix test` no longer auto-loads modules from
 # `:elixirc_paths` test directories at test-helper time — only files
@@ -34,92 +54,58 @@ Mox.defmock(PhoenixKitAI.Test.RealtimeMock, for: Xai.RealtimeBehaviour)
 
 alias PhoenixKitAI.Test.Repo, as: TestRepo
 
-# Check if the test database exists before trying to connect.
 db_config = Application.get_env(:phoenix_kit_ai, TestRepo, [])
 db_name = db_config[:database] || "phoenix_kit_ai_test"
 
-db_check =
-  try do
-    case System.cmd("psql", ["-lqt"], stderr_to_stdout: true) do
-      {output, 0} ->
-        exists =
-          output
-          |> String.split("\n")
-          |> Enum.any?(fn line ->
-            line |> String.split("|") |> List.first("") |> String.trim() == db_name
-          end)
-
-        if exists, do: :exists, else: :not_found
-
-      _ ->
-        :try_connect
-    end
-  rescue
-    # `psql` not on PATH — System.cmd raises :enoent. Fall through to
-    # the connect attempt which will fail-soft and skip integration tests.
-    ErlangError -> :try_connect
-  end
+skip_db? = System.get_env("PK_AI_SKIP_DB") in ["1", "true"]
 
 repo_available =
-  if db_check == :not_found do
+  if skip_db? do
     IO.puts("""
-    \n⚠  Test database "#{db_name}" not found — integration tests excluded.
-       Run: createdb #{db_name}
+    \n⚠  PK_AI_SKIP_DB=1 — skipping database "#{db_name}", excluding :integration tests.
+       This is a manual opt-out for a contributor machine with no Postgres.
+       `mix test` normally creates its own database (see the `test:` alias
+       in mix.exs), so do NOT set this in CI or the standard/precommit
+       workflow: a database failure there is a real problem, not something
+       to route around silently.
     """)
 
     false
   else
-    try do
-      {:ok, _} = TestRepo.start_link()
+    # Deliberately unguarded — no rescue, no catch. An unusable database
+    # (missing, unreachable, wrong role, migrations that fail) must crash
+    # test_helper.exs here with a nonzero exit and Postgrex's own error
+    # in the log, not get caught and silently downgraded to "exclude
+    # :integration". See the module doc above for why.
+    {:ok, _} = TestRepo.start_link()
 
-      # Build the schema directly from core's versioned migrations —
-      # same call the host app makes in production. Core's V40 creates
-      # the `uuid-ossp` / `pgcrypto` extensions + `uuid_generate_v7()`
-      # function; V57+ creates the AI tables; V107 adds the
-      # `integration_uuid` column + UNIQUE index on `lower(name)` that
-      # this module's schema and tests depend on. No module-owned DDL.
-      #
-      # Standalone runs against Hex `phoenix_kit ~> 1.7` will fail at
-      # boot with "column integration_uuid does not exist" if the
-      # published Hex version pre-dates V107 — that's expected. The
-      # canonical test channel for this module is via
-      # `phoenix_kit_parent` (path-dep `override: true` resolves
-      # `phoenix_kit` to the local checkout, which has V107). See
-      # ~/.claude memory `feedback_run_tests_via_parent.md`.
-      #
-      # `ensure_current/2` (core 1.7.105+ / phoenix_kit#515) re-applies
-      # any newly-shipped Vxxx migrations on every boot by passing a
-      # fresh wall-clock version to Ecto.Migrator. Replaces the
-      # `Ecto.Migrator.run([{0, PhoenixKit.Migration}], :up, all: true)`
-      # pattern, which silently stopped re-applying once `0` was
-      # recorded in `schema_migrations` — see
-      # `dev_docs/migration_cleanup.md` for the staleness story.
-      PhoenixKit.Migration.ensure_current(TestRepo, log: false)
+    # Build the schema directly from core's versioned migrations — same
+    # call the host app makes in production. Core's V40 creates the
+    # `uuid-ossp` / `pgcrypto` extensions + `uuid_generate_v7()` function;
+    # V57+ creates the AI tables; V107 adds the `integration_uuid` column
+    # + UNIQUE index on `lower(name)` that this module's schema and tests
+    # depend on. No module-owned DDL.
+    #
+    # Standalone runs against Hex `phoenix_kit ~> 1.7` will fail at boot
+    # with "column integration_uuid does not exist" if the published Hex
+    # version pre-dates V107 — that's expected. The canonical test channel
+    # for this module is via `phoenix_kit_parent` (path-dep
+    # `override: true` resolves `phoenix_kit` to the local checkout,
+    # which has V107). See ~/.claude memory
+    # `feedback_run_tests_via_parent.md`.
+    #
+    # `ensure_current/2` (core 1.7.105+ / phoenix_kit#515) re-applies any
+    # newly-shipped Vxxx migrations on every boot by passing a fresh
+    # wall-clock version to Ecto.Migrator. Replaces the
+    # `Ecto.Migrator.run([{0, PhoenixKit.Migration}], :up, all: true)`
+    # pattern, which silently stopped re-applying once `0` was recorded in
+    # `schema_migrations` — see `dev_docs/migration_cleanup.md` for the
+    # staleness story.
+    PhoenixKit.Migration.ensure_current(TestRepo, log: false)
 
-      Ecto.Adapters.SQL.Sandbox.mode(TestRepo, :manual)
-      true
-    rescue
-      e ->
-        IO.puts("""
-        \n⚠  Could not connect to test database — integration tests excluded.
-           Run: createdb #{db_name}
-           Error: #{Exception.message(e)}
-        """)
-
-        false
-    catch
-      :exit, reason ->
-        IO.puts("""
-        \n⚠  Could not connect to test database — integration tests excluded.
-           Run: createdb #{db_name}
-           Error: #{inspect(reason)}
-        """)
-
-        false
-    end
+    Ecto.Adapters.SQL.Sandbox.mode(TestRepo, :manual)
+    true
   end
-
-Application.put_env(:phoenix_kit_ai, :test_repo_available, repo_available)
 
 # Start minimal PhoenixKit services needed for tests
 {:ok, _pid} = PhoenixKit.PubSub.Manager.start_link([])
@@ -158,7 +144,8 @@ Application.put_env(:phoenix_kit_ai, :test_repo_available, repo_available)
 
 # Start the test Endpoint so Phoenix.LiveViewTest can drive LiveViews
 # via `live/2` with real URLs. Runs with `server: false` so no port is
-# opened.
+# opened. Only meaningful when the repo is actually up — under
+# PK_AI_SKIP_DB every LiveView test is excluded via :integration anyway.
 if repo_available do
   {:ok, _} = PhoenixKitAI.Test.Endpoint.start_link()
 end
@@ -168,6 +155,11 @@ end
 # `Tab.localized_label/1` doesn't exist before it. This module's `phoenix_kit`
 # floor (~> 2.0) is well past that release, so this is normally a formality,
 # but it keeps CI green if a consumer ever resolves an older pin.
+#
+# This one stays a genuine capability probe, not a fail-soft: it keys on
+# `function_exported?/3` at compile-resolved-dependency time, which never
+# raises and never depends on the database, so there is nothing here to
+# swallow.
 i18n_api_available =
   Code.ensure_loaded?(PhoenixKit.Dashboard.Tab) and
     function_exported?(PhoenixKit.Dashboard.Tab, :localized_label, 1)
@@ -182,10 +174,11 @@ unless i18n_api_available do
   )
 end
 
-# Exclude integration tests when DB is not available
+# Exclude :integration only under the explicit PK_AI_SKIP_DB opt-out above
+# — never as a side effect of the database being broken.
 exclude =
   [
-    if(!repo_available, do: :integration),
+    if(skip_db?, do: :integration),
     if(!i18n_api_available, do: :requires_phoenix_kit_i18n_api)
   ]
   |> Enum.reject(&is_nil/1)
