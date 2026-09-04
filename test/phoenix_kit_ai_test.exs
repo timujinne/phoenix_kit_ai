@@ -141,6 +141,20 @@ defmodule PhoenixKitAITest do
       assert is_binary(version)
       assert version == "0.20.0"
     end
+
+    # The package hardcodes its version in three places: mix.exs's @version,
+    # `version/0`, and the literal above. Pinning only the literal catches a
+    # stale `version/0` at the moment of the bump and never again — bump
+    # mix.exs to 0.21.0, forget `version/0`, then "fix" the literal to match
+    # what `version/0` still returns, and the assertion above passes while the
+    # package reports the wrong version to every host's module registry.
+    # Comparing against the version this build was actually compiled with is
+    # the assertion that cannot be satisfied by editing the test alone.
+    test "matches the version mix.exs builds the package with" do
+      assert PhoenixKitAI.version() == Mix.Project.config()[:version],
+             "PhoenixKitAI.version/0 (#{PhoenixKitAI.version()}) has drifted from " <>
+               "mix.exs's @version (#{Mix.Project.config()[:version]}). Both must move together."
+    end
   end
 
   describe "css_sources/0" do
