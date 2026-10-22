@@ -159,6 +159,75 @@ keep forever". Every usage row emits `[:phoenix_kit_ai, :request]`
 telemetry; the full contract is in
 `dev_docs/guides/spend-caps-and-caching.md`.
 
+### AI tasks and the model check
+
+A module declares what it uses AI for, and what the model must be able to
+do, in an `ai_tasks/0` callback; calls name the task.
+
+```elixir
+def ai_tasks do
+  [
+    %PhoenixKitAI.TaskSpec{
+      key: "my_module.photo_count",
+      label: "Count items in a photo",
+      purpose: "Count the stock items visible in a shelf photo.",
+      needs: [:vision, :json_schema],
+      endpoints: {MyModule.Settings, :photo_endpoint_uuids, []}
+    }
+  ]
+end
+
+{:ok, %{json: json, request_uuid: row}} =
+  PhoenixKitAI.describe_image(endpoint_uuid, photos, task: "my_module.photo_count", schema: schema)
+
+# A settings form, before saving the chosen endpoint
+:ok = PhoenixKitAI.Tasks.check_selection("my_module.photo_count", endpoint_uuid)
+PhoenixKitAI.Tasks.endpoint_options("my_module.photo_count")  # [%{endpoint:, fitness:}]
+```
+
+Before any HTTP, every verb checks the model (or the call's `model:`
+override) against the task's `needs` and what the call itself shows —
+image parts, `tools:`, `schema:` / `json:`. A model that says no to
+images, tools or a JSON schema is refused with
+`{:error, {:model_unfit, missing}}`, written as an error row marked
+`refused: true` that no usage sink receives; an unknown capability passes
+unless `ai_guard_verified_models_only` is on. Each usage row carries
+`metadata.task`, and each result the uuid of its row (`"request_uuid"` /
+`:request_uuid`). «AI → Tasks» lists the declared tasks with their
+endpoints and fitness.
+
+### Task limits
+
+A task can be limited — the whole task, and each user in it — in money,
+requests and tokens, per calendar day and month of the site time zone. An
+admin sets them on «AI → Tasks» (with the `ai.manage` permission), a
+declaration can give defaults, and a user can have personal limits:
+
+```elixir
+%PhoenixKitAI.TaskSpec{
+  key: "my_module.photo_count",
+  default_limits: %{user: %{requests: %{day: 50}}, task: %{money: %{month: 20_000_000}}},
+  watchers: {MyModule.Settings, :limit_watchers, []}   # called with the user uuid appended
+}
+
+{:error, {:task_limit_exceeded, :user, :requests, :day}} =
+  PhoenixKitAI.ask(endpoint_uuid, "…", task: "my_module.photo_count", user_uuid: user_uuid)
+
+# Several calls for one piece of work: the limits are checked once.
+{:ok, token} = PhoenixKitAI.Guard.admit("my_module.photo_count", user_uuid, turn_ref, 300)
+PhoenixKitAI.ask(endpoint_uuid, "…", task: "my_module.photo_count", user_uuid: user_uuid,
+  guard_admission: token)
+```
+
+Money is in micro-dollars and counts only where the provider reports a
+call's cost (OpenRouter); an empty limit is none, `0` allows nothing. Only
+successful calls count — a cached answer is one request — and a refusal is
+an error row like the model check's. At the warn percent (default 80) and
+when a limit is reached, the user and the watchers (`ai_guard_watchers`,
+else every Owner, plus the task's own) get a notification of type
+`"ai_guard"`, once per window; a `Budget` refusal is told once a day, and a
+task whose endpoint's model stops fitting once a day per endpoint.
+
 ### Host apps in the translation pipeline
 
 ```elixir
@@ -640,14 +709,31 @@ test/
 
 ## Database tables
 
-All tables use UUIDv7 primary keys and timestamptz columns. Migrations
-are managed by the parent PhoenixKit project — this repo has no
-migrations of its own.
+All tables use UUIDv7 primary keys and timestamptz columns. The three
+tables below are created by the parent PhoenixKit project's migrations:
 
 - **`phoenix_kit_ai_endpoints`** — endpoint configurations
 - **`phoenix_kit_ai_prompts`** — prompt templates
 - **`phoenix_kit_ai_requests`** — request logs (FK to endpoints, prompts,
   users)
+
+The module's own chain (`PhoenixKitAI.Migrations`, run by
+`mix phoenix_kit.update` after core's) holds only tables core does not
+create:
+
+- **`phoenix_kit_ai_model_capabilities`** — the snapshot of what each
+  endpoint's model can do (images, tools, JSON schema), read from the
+  provider's catalogue
+- **`phoenix_kit_ai_task_settings`**, **`phoenix_kit_ai_task_user_limits`**
+  — the limits of AI tasks and users' personal limits
+- **`phoenix_kit_ai_guard_events`** — what the task guard noticed (limits,
+  models that stopped fitting), deduplicated per window; kept 180 days (a
+  daily job the module schedules in core's `default` queue)
+
+It also adds one index to core's `phoenix_kit_ai_requests`:
+`((metadata->>'task'), inserted_at)`. It is built inside the migration's
+transaction, not concurrently, and AI usage rows wait while it builds: on a
+large journal, measure it first and update in a quiet window.
 
 ## Admin pages
 
@@ -659,6 +745,7 @@ migrations of its own.
 | Prompt form | `/admin/ai/prompts/new`, `.../edit` | Create/edit with variable extraction |
 | Playground | `/admin/ai/playground` | Interactive testing with live variables |
 | Usage | `/admin/ai/usage` | Dashboard stats and request history |
+| Tasks | `/admin/ai/tasks` | Declared AI tasks, their needs, endpoints and fitness; limits, use, watchers (changes need `ai.manage`) |
 
 ## Supported providers
 

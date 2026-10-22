@@ -26,6 +26,8 @@ defmodule PhoenixKitAI.OpenRouterClient do
 
   alias PhoenixKit.Utils.Values
   alias PhoenixKitAI.AIModel
+  alias PhoenixKitAI.AnthropicPricing
+  alias PhoenixKitAI.Capabilities
   alias PhoenixKitAI.Endpoint
   alias PhoenixKitAI.Web.MessageShape
 
@@ -116,22 +118,32 @@ defmodule PhoenixKitAI.OpenRouterClient do
   - `pricing` - Pricing information (prompt/completion costs)
   - `context_length` - Maximum context window
   - `architecture` - Model architecture details
+  - `capabilities` - What the model can do (`PhoenixKitAI.Capabilities`)
+
+  An Anthropic endpoint (provider `"anthropic"`, or a base URL on
+  `api.anthropic.com`) is read from Anthropic's native `/v1/models`, every
+  page and every lifecycle stage, since its rows carry the capabilities and
+  the lifecycle the OpenAI-compatible shape has no room for.
   """
   def fetch_models(api_key, opts \\ []) do
     base_url = Keyword.get(opts, :base_url, @base_url)
-    url = "#{base_url}/models"
-
-    headers =
-      build_headers(api_key, opts) ++
-        Keyword.get_lazy(opts, :extra_headers, fn -> provider_headers(base_url) end)
-
     model_type = Keyword.get(opts, :model_type, :all)
+
+    case Capabilities.catalogue_kind(Keyword.get(opts, :fallback_provider), base_url) do
+      :anthropic -> fetch_anthropic_models(api_key, base_url, opts, model_type)
+      kind -> fetch_openai_models(api_key, base_url, opts, model_type, kind)
+    end
+  end
+
+  defp fetch_openai_models(api_key, base_url, opts, model_type, kind) do
+    url = "#{base_url}/models"
+    headers = build_headers(api_key, opts)
 
     case http_get(url, headers) do
       {:ok, %{status_code: 200, body: body}} ->
         case Jason.decode(body) do
           {:ok, %{"data" => models}} when is_list(models) ->
-            {:ok, normalize_models(models, model_type)}
+            {:ok, normalize_models(models, model_type, kind)}
 
           {:ok, _} ->
             {:error, :invalid_response_format}
@@ -155,29 +167,6 @@ defmodule PhoenixKitAI.OpenRouterClient do
         {:error, {:connection_error, reason}}
     end
   end
-
-  # Without `:extra_headers`, the ones the core registry declares for the
-  # provider whose base URL this is (Anthropic's `anthropic-version`): a
-  # caller that knows only an endpoint's base URL lists its models too.
-  defp provider_headers(base_url) when is_binary(base_url) do
-    base = String.trim_trailing(base_url, "/")
-
-    :ai_completions
-    |> PhoenixKit.Integrations.Providers.with_capability()
-    |> Enum.find_value([], fn provider ->
-      with url when is_binary(url) <- provider[:base_url],
-           true <- String.trim_trailing(url, "/") == base,
-           %{extra_headers: headers} when is_list(headers) <- provider[:validation] do
-        headers
-      else
-        _ -> nil
-      end
-    end)
-  rescue
-    _ -> []
-  end
-
-  defp provider_headers(_base_url), do: []
 
   @doc """
   Fetches models and groups them by provider.
@@ -870,10 +859,9 @@ defmodule PhoenixKitAI.OpenRouterClient do
     end
   end
 
-  defp normalize_models(models, model_type) do
+  defp normalize_models(models, model_type, kind) do
     models
     |> Enum.filter(&model_matches_type?(&1, model_type))
-    |> Enum.map(&anthropic_fields/1)
     |> Enum.map(fn model ->
       top_provider = model["top_provider"] || %{}
 
@@ -886,34 +874,124 @@ defmodule PhoenixKitAI.OpenRouterClient do
         supported_parameters: model["supported_parameters"] || [],
         pricing: normalize_pricing(model),
         architecture: model["architecture"] || %{},
-        top_provider: top_provider
+        top_provider: top_provider,
+        # Only OpenRouter's rows describe capabilities; any other
+        # OpenAI-compatible `/models` is read as saying nothing.
+        capabilities:
+          if(kind == :openrouter, do: Capabilities.from_openrouter(model), else: %Capabilities{})
       }
     end)
   end
 
-  # Anthropic's own `/models` entries name their fields differently and list
-  # no `supported_parameters` (`PhoenixKitAI.Anthropic.model_fields/1`).
-  defp anthropic_fields(model) do
-    if PhoenixKitAI.Anthropic.model?(model) do
-      fields = PhoenixKitAI.Anthropic.model_fields(model)
+  # Anthropic's native `/v1/models`: Bearer works there as on the
+  # compatibility layer, plus the version header. Pages of up to 1000 are
+  # followed by `last_id` while `has_more`. Without a `lifecycle` filter the
+  # list leaves retired models out, so all three stages are asked for; a
+  # server that refuses the filter is asked again without it.
+  @anthropic_version "2023-06-01"
+  @anthropic_lifecycles "active,deprecated,retired"
+  @anthropic_page_size 1000
+  @anthropic_max_pages 20
 
-      model
-      |> Map.merge(Map.take(fields, ["name", "context_length", "supported_parameters"]))
-      |> Map.update(
-        "architecture",
-        %{"input_modalities" => fields["input_modalities"]},
-        &Map.put_new(&1, "input_modalities", fields["input_modalities"])
-      )
-      |> Map.put(
-        "top_provider",
-        Map.put(
-          model["top_provider"] || %{},
-          "max_completion_tokens",
-          fields["max_completion_tokens"]
-        )
-      )
-    else
-      model
+  defp fetch_anthropic_models(api_key, base_url, opts, model_type) do
+    headers = [
+      {"anthropic-version", @anthropic_version}
+      | build_headers(api_key, Keyword.put(opts, :include_usage, false))
+    ]
+
+    url = "#{String.trim_trailing(base_url, "/")}/models"
+
+    result =
+      case anthropic_pages(url, headers, [lifecycle: @anthropic_lifecycles], nil, [], 1) do
+        {:error, {:api_error, 400}} -> anthropic_pages(url, headers, [], nil, [], 1)
+        other -> other
+      end
+
+    with {:ok, rows} <- result do
+      {:ok, normalize_anthropic_models(rows, model_type)}
+    end
+  end
+
+  defp anthropic_pages(_url, _headers, _filter, _after_id, _acc, page)
+       when page > @anthropic_max_pages,
+       do: {:error, :invalid_response_format}
+
+  defp anthropic_pages(url, headers, filter, after_id, acc, page) do
+    query =
+      [limit: @anthropic_page_size] ++ filter ++ if(after_id, do: [after_id: after_id], else: [])
+
+    case http_get("#{url}?#{URI.encode_query(query)}", headers) do
+      {:ok, %{status_code: 200, body: body}} ->
+        case decode_anthropic_page(body) do
+          {:ok, rows, nil} ->
+            {:ok, acc ++ rows}
+
+          {:ok, rows, last_id} ->
+            anthropic_pages(url, headers, filter, last_id, acc ++ rows, page + 1)
+
+          error ->
+            error
+        end
+
+      {:ok, %{status_code: 401}} ->
+        {:error, :invalid_api_key}
+
+      {:ok, %{status_code: status}} ->
+        Logger.warning("Anthropic models fetch failed: #{status}")
+        {:error, {:api_error, status}}
+
+      {:error, reason} ->
+        Logger.warning("Anthropic models fetch transport error: #{MessageShape.describe(reason)}")
+
+        {:error, {:connection_error, reason}}
+    end
+  end
+
+  # `{:ok, rows, last_id}`, with `last_id` nil on the last page.
+  defp decode_anthropic_page(body) do
+    case Jason.decode(body) do
+      {:ok, %{"data" => rows, "has_more" => true, "last_id" => last_id}}
+      when is_list(rows) and is_binary(last_id) ->
+        {:ok, rows, last_id}
+
+      # More pages, but no cursor to ask for them: the list is cut short,
+      # and taking it as complete would drop the rest of the models.
+      {:ok, %{"has_more" => true}} ->
+        {:error, :invalid_response_format}
+
+      {:ok, %{"data" => rows}} when is_list(rows) ->
+        {:ok, rows, nil}
+
+      {:ok, _} ->
+        {:error, :invalid_response_format}
+
+      {:error, _} ->
+        {:error, :invalid_json_response}
+    end
+  end
+
+  # Anthropic lists no prices and no sampling parameters. The prices come
+  # from `AnthropicPricing`; a model it has no rate for shows no price
+  # rather than a free one.
+  defp normalize_anthropic_models(rows, model_type) do
+    rows
+    |> Enum.filter(&(is_binary(&1["id"]) and model_matches_type?(&1, model_type)))
+    |> Enum.map(fn row ->
+      %AIModel{
+        id: row["id"],
+        name: row["display_name"] || row["id"],
+        context_length: row["max_input_tokens"],
+        max_completion_tokens: row["max_tokens"],
+        pricing: anthropic_pricing(row["id"]),
+        capabilities: Capabilities.from_anthropic(row)
+      }
+    end)
+  end
+
+  defp anthropic_pricing(model) do
+    case AnthropicPricing.per_token(model) do
+      {prompt, completion} -> %{"prompt" => prompt, "completion" => completion}
+      nil -> %{"prompt" => nil, "completion" => nil}
     end
   end
 
@@ -928,12 +1006,13 @@ defmodule PhoenixKitAI.OpenRouterClient do
 
   defp model_matches_type?(model, :text) do
     # A TTS model would otherwise slip into the chat list — Mistral's
-    # Voxtral TTS models carry no modality and would match the "" branch
+    # Voxtral TTS models carry no modality and would match the [] branch
     # below — so exclude them explicitly to keep the chat picker clean.
     not tts_model?(model) and
-      case get_modality(model) do
-        # OpenRouter: explicit "text->text" modality
-        "text->text" -> true
+      case output_modalities(model) do
+        # Text out, whatever goes in: a model that also takes images
+        # ("text+image->text") is a chat model too.
+        ["text"] -> true
         # No modality field at all (Mistral, DeepSeek — OpenAI-compatible
         # /models endpoints don't return architecture metadata). Treat as
         # text by default since callers asking for `:text` against an
@@ -942,18 +1021,13 @@ defmodule PhoenixKitAI.OpenRouterClient do
         # chat models into the same no-modality response as its
         # `grok-imagine-*` image/video generation models, so those need
         # explicit exclusion here.
-        "" -> not generative_media_model?(model)
+        [] -> not generative_media_model?(model)
         _ -> false
       end
   end
 
   defp model_matches_type?(model, :vision) do
-    case get_modality(model) do
-      "text+image->text" -> true
-      # Anthropic lists no modality; its entries say whether they take images.
-      "" -> get_in(model, ["capabilities", "image_input", "supported"]) == true
-      _ -> false
-    end
+    get_modality(model) == "text+image->text"
   end
 
   defp model_matches_type?(model, :image_gen) do
@@ -1017,6 +1091,24 @@ defmodule PhoenixKitAI.OpenRouterClient do
   defp get_modality(model) do
     architecture = model["architecture"] || %{}
     architecture["modality"] || ""
+  end
+
+  # OpenRouter lists `output_modalities`; the older `modality` string carries
+  # the same on its right side ("text+image->text"). `[]` when the model
+  # declares neither.
+  defp output_modalities(model) do
+    architecture = model["architecture"] || %{}
+
+    case {architecture["output_modalities"], get_modality(model)} do
+      {outputs, _modality} when is_list(outputs) and outputs != [] ->
+        outputs
+
+      {_outputs, ""} ->
+        []
+
+      {_outputs, modality} ->
+        modality |> String.split("->") |> List.last() |> String.split("+")
+    end
   end
 
   defp provider_from_model(model, fallback_provider) do
@@ -1124,13 +1216,7 @@ defmodule PhoenixKitAI.OpenRouterClient do
     }
   end
 
-  # Anthropic's `/models` names no price at all: unknown, not free, so the
-  # model card shows no price badge rather than "$0.00".
-  defp normalize_pricing(model) do
-    if PhoenixKitAI.Anthropic.model?(model),
-      do: %{"prompt" => nil, "completion" => nil},
-      else: %{"prompt" => 0, "completion" => 0}
-  end
+  defp normalize_pricing(_model), do: %{"prompt" => 0, "completion" => 0}
 
   defp flat_token_price_to_dollars(value) when is_number(value), do: value / 10_000_000_000
   defp flat_token_price_to_dollars(_), do: 0
