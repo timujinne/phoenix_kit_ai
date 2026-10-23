@@ -3677,8 +3677,3 @@ msgstr ""
 #, elixir-autogen, elixir-format
 msgid "Needed by the tasks that declare it."
 msgstr ""
-
-#: lib/phoenix_kit_ai/web/endpoint_form.html.heex:769
-#, elixir-autogen, elixir-format
-msgid "Anthropic: on, the model thinks as it does by default (Claude 5 models think); off, thinking is turned off where the model allows it (not on Claude Opus 5.5 or Fable). Anthropic's OpenAI-compatible API ignores the effort level; a token limit is sent only to a model that takes a thinking budget."
-msgstr ""

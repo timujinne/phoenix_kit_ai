@@ -27,7 +27,6 @@ defmodule PhoenixKitAI.OpenRouterClient do
   alias PhoenixKit.Integrations.Providers
   alias PhoenixKit.Utils.Values
   alias PhoenixKitAI.AIModel
-  alias PhoenixKitAI.AnthropicPricing
   alias PhoenixKitAI.Capabilities
   alias PhoenixKitAI.Endpoint
   alias PhoenixKitAI.Web.MessageShape
@@ -1012,13 +1011,6 @@ defmodule PhoenixKitAI.OpenRouterClient do
         capabilities: Capabilities.from_anthropic(row)
       }
     end)
-  end
-
-  defp anthropic_pricing(model) do
-    case AnthropicPricing.per_token(model) do
-      {prompt, completion} -> %{"prompt" => prompt, "completion" => completion}
-      nil -> %{"prompt" => nil, "completion" => nil}
-    end
   end
 
   # Filter models by type based on architecture.modality

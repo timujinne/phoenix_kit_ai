@@ -22,14 +22,7 @@ defmodule PhoenixKitAI.Completion do
 
   require Logger
 
-  alias PhoenixKitAI.{
-    AnthropicPricing,
-    Capabilities,
-    Endpoint,
-    Images,
-    OpenRouterClient,
-    Provider
-  }
+  alias PhoenixKitAI.{Capabilities, Endpoint, Images, OpenRouterClient, Provider}
 
   @timeout 120_000
 
@@ -104,10 +97,7 @@ defmodule PhoenixKitAI.Completion do
 
     case http_post(url, headers, body) do
       {:ok, %{status_code: 200, body: response_body}} ->
-        response_body
-        |> parse_success_response(start_time)
-        |> priced(endpoint, body)
-        |> with_sent_params(body)
+        response_body |> parse_success_response(start_time) |> with_sent_params(body)
 
       {:ok, %{status_code: status, body: response_body}} ->
         status |> handle_error_status(response_body) |> with_sent_params(body)
@@ -141,26 +131,6 @@ defmodule PhoenixKitAI.Completion do
         {:error, :invalid_json_response}
     end
   end
-
-  # Anthropic's answer carries tokens but no cost: the cost is computed from
-  # its rate table (`AnthropicPricing`) and put where OpenRouter puts its own,
-  # `usage.cost` in dollars, so every reader of the answer finds it there.
-  defp priced({:ok, %{"usage" => usage} = response}, endpoint, body) when is_map(usage) do
-    cost =
-      if anthropic?(endpoint) and not is_number(usage["cost"]),
-        do:
-          AnthropicPricing.cost(
-            response["model"] || body["model"],
-            usage["prompt_tokens"],
-            usage["completion_tokens"]
-          )
-
-    if cost,
-      do: {:ok, Map.put(response, "usage", Map.put(usage, "cost", cost))},
-      else: {:ok, response}
-  end
-
-  defp priced(result, _endpoint, _body), do: result
 
   defp error_in_body(code, body) when is_integer(code), do: handle_error_status(code, body)
   defp error_in_body(_code, _body), do: {:error, :invalid_response_format}

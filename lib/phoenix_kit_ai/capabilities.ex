@@ -87,7 +87,6 @@ defmodule PhoenixKitAI.Capabilities do
 
   alias PhoenixKit.PubSub.Manager, as: PubSub
   alias PhoenixKitAI.AIModel
-  alias PhoenixKitAI.AnthropicPricing
   alias PhoenixKitAI.Endpoint
   alias PhoenixKitAI.ModelCapability
   alias PhoenixKitAI.OpenRouterClient
@@ -472,14 +471,6 @@ defmodule PhoenixKitAI.Capabilities do
       thinking_adaptive: thinking_type(row["capabilities"], "adaptive"),
       thinking_between_tools: thinking_type(row["capabilities"], "between_tools")
     }
-    |> anthropic_prices(row["id"])
-  end
-
-  defp anthropic_prices(caps, model) do
-    case AnthropicPricing.per_token(model) do
-      {prompt, completion} -> %{caps | prompt_price: prompt, completion_price: completion}
-      nil -> caps
-    end
   end
 
   @doc "Reads a DeepSeek `/models` row."
