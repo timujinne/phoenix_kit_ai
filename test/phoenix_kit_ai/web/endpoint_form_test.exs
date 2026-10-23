@@ -22,6 +22,37 @@ defmodule PhoenixKitAI.Web.EndpointFormTest do
   end
 
   describe "new with a model to start from" do
+    test "keeps the recommendation's custom base URL", %{conn: conn} do
+      connection = seed_openrouter_connection("prefill-proxy")
+      base_url = "https://gateway.example.com/v1"
+      source = fixture_endpoint(base_url: base_url, integration_uuid: connection.uuid)
+
+      query =
+        URI.encode_query(%{
+          "name" => "Proxy model",
+          "model" => "vendor/model",
+          "integration_uuid" => connection.uuid,
+          "source_endpoint_uuid" => source.uuid
+        })
+
+      {:ok, view, _html} = live(conn, "/en/admin/ai/endpoints/new?" <> query)
+      assert has_element?(view, "input[name='endpoint[base_url]'][value='#{base_url}']")
+      assert :sys.get_state(view.pid).socket.assigns.form[:base_url].value == base_url
+
+      view |> form("#ai-endpoint-form") |> render_submit()
+
+      assert %{base_url: ^base_url, model: "vendor/model"} =
+               PhoenixKitAI.get_endpoint_by_name("Proxy model")
+    end
+
+    test "does not trust a URL passed directly in a recommendation link", %{conn: conn} do
+      query =
+        URI.encode_query(%{"base_url" => "http://127.0.0.1/v1", "source_endpoint_uuid" => "bad"})
+
+      {:ok, view, _html} = live(conn, "/en/admin/ai/endpoints/new?" <> query)
+      refute has_element?(view, "input[value='http://127.0.0.1/v1']")
+    end
+
     test "prefills the name, the model and the integration, and saves nothing", %{conn: conn} do
       connection = seed_openrouter_connection("prefill-#{System.unique_integer([:positive])}")
       {_, before} = PhoenixKitAI.list_endpoints()
@@ -319,12 +350,11 @@ defmodule PhoenixKitAI.Web.EndpointFormTest do
       assert assigns.integration_connected == false
     end
 
-    test "new endpoint with exactly one connection still leaves picker empty",
+    test "new endpoint whose only connection has no credentials leaves picker empty",
          %{conn: conn} do
-      # The picker mirrors the endpoint's actual stored state. A new
-      # endpoint has no integration pinned, so the picker shows nothing
-      # selected — even when only one connection exists. Auto-selecting
-      # would mask "no integration set" with "an integration is set".
+      # Only a usable connection (one with credentials) is picked on its
+      # own — see EndpointFormConnectionTest. A connection without a key
+      # is left for the person to pick.
       seed_openrouter_connection("auto-#{System.unique_integer([:positive])}")
 
       {:ok, view, _html} = live(conn, "/en/admin/ai/endpoints/new")

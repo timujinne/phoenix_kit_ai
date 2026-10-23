@@ -55,15 +55,20 @@ defmodule PhoenixKitAI.Web.Components.TaskModelPickerTest do
   defp recs(overrides \\ %{}) do
     Map.merge(
       %{
+        spec: %PhoenixKitAI.TaskSpec{key: "test.photo", needs: [:vision, :json_schema]},
+        filters: [:vision],
         estimate: :declared,
         tokens: {10_000, 1_000},
-        cheapest: [
+        possible: [],
+        experimental: [],
+        verified: [
           %{
             model: "google/gemini-flash",
             name: "Gemini Flash",
             provider: :openrouter,
             base_url: "https://openrouter.ai/api/v1",
             integration_uuid: "0191-int",
+            source_endpoint_uuid: "0191-source",
             context_length: 1_000_000,
             price_per_call: 0.0014,
             price_known?: true,
@@ -177,7 +182,7 @@ defmodule PhoenixKitAI.Web.Components.TaskModelPickerTest do
   end
 
   describe "the recommendations panel" do
-    test "is collapsed and lists the cheapest fit models and the ones that worked" do
+    test "is collapsed and lists the models that can do it and the ones that worked" do
       html = render_picker(%{})
 
       assert present?(html, "details[id$='-recommendations']:not([open])")
@@ -227,6 +232,14 @@ defmodule PhoenixKitAI.Web.Components.TaskModelPickerTest do
       html = render_picker(%{})
       row = "[data-recommended-model='google/gemini-flash']"
 
+      # No endpoint has the model yet: nothing to mark, so the hint only says so.
+      assert [title] =
+               doc(html)
+               |> LazyHTML.query("#{row} [data-capability=json_schema][data-state=unknown]")
+               |> LazyHTML.attribute("title")
+
+      assert String.ends_with?(title, "Not verified")
+
       assert present?(html, "#{row} [data-capability=vision][data-state=yes]")
       assert present?(html, "#{row} [data-capability=tools]")
       assert present?(html, "#{row} [data-capability=json_schema][data-state=unknown]")
@@ -247,7 +260,7 @@ defmodule PhoenixKitAI.Web.Components.TaskModelPickerTest do
         recs(%{
           estimate: :rough,
           tokens: nil,
-          cheapest: [%{hd(recs().cheapest) | price_per_call: nil}],
+          verified: [%{hd(recs().verified) | price_per_call: nil}],
           worked: []
         })
 
@@ -260,7 +273,7 @@ defmodule PhoenixKitAI.Web.Components.TaskModelPickerTest do
     end
 
     test "says so when nothing fits" do
-      html = render_picker(%{recommendations: recs(%{cheapest: [], worked: []})})
+      html = render_picker(%{recommendations: recs(%{verified: [], worked: []})})
       assert present?(html, "[data-recommended-empty]")
     end
 
@@ -290,12 +303,18 @@ defmodule PhoenixKitAI.Web.Components.TaskModelPickerTest do
       for {locale, expected} <- [
             {"ru",
              [
-               "Подходят и дешевле всего",
-               "Уже работали в этой задаче",
+               "Умеют всё нужное (проверено)",
+               "Должна уметь:",
+               "Модели, использованные в этой задаче",
                "цена не известна",
                "бесплатная — лимиты"
              ]},
-            {"et", ["Sobivad ja odavaimad", "Selles ülesandes juba töötanud", "hind pole teada"]}
+            {"et",
+             [
+               "Oskavad kõike vajalikku (kontrollitud)",
+               "Selles ülesandes kasutatud mudelid",
+               "hind pole teada"
+             ]}
           ] do
         Gettext.put_locale(PhoenixKitAI.Gettext, locale)
         html = render_picker(%{scope: scope(["ai"])})
@@ -346,6 +365,8 @@ defmodule PhoenixKitAI.Web.Components.TaskModelPickerTest do
       assert URI.decode_query(query) == %{
                "model" => "google/gemini-flash",
                "integration_uuid" => "0191-int",
+               "source_endpoint_uuid" => "0191-source",
+               "provider" => "openrouter",
                "name" => "Gemini Flash"
              }
     end

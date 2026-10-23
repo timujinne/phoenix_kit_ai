@@ -20,6 +20,11 @@ defmodule PhoenixKitAI.AnthropicPricing do
   A model is looked up by its id without a trailing date
   (`claude-sonnet-4-5-20250929` → `claude-sonnet-4-5`). A model that is in
   neither table has no price: its calls are logged without a cost, as before.
+
+  The table is the last source of a call's cost (`PhoenixKitAI.CallCost`):
+  after the provider's own cost, a catalogue price and the endpoint's manual
+  price — so a manual price corrects a stale rate. It is never shown as a
+  catalogue price. Ported from BeamLabEU/phoenix_kit_ai#47 (8e8c65e).
   Not covered: US-only inference (`inference_geo`, ×1.1), which this module
   never asks for, and the Batch API.
   """
@@ -80,6 +85,23 @@ defmodule PhoenixKitAI.AnthropicPricing do
   end
 
   def cost(_model, _prompt_tokens, _completion_tokens), do: nil
+
+  @doc """
+  The rate for a call of `prompt_tokens` input tokens as whole micro-dollars
+  per 1M tokens (`%{"input" => µ$, "output" => µ$}`, the shape of a manual
+  price), or `nil` when the model has no price here.
+  """
+  @spec micro_per_million(String.t() | nil, non_neg_integer()) ::
+          %{String.t() => non_neg_integer()} | nil
+  def micro_per_million(model, prompt_tokens) do
+    case rate(model, prompt_tokens) do
+      {input, output} ->
+        %{"input" => round(input * 1_000_000), "output" => round(output * 1_000_000)}
+
+      nil ->
+        nil
+    end
+  end
 
   defp rate(model, prompt_tokens \\ 0)
 

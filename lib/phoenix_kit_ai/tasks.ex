@@ -15,8 +15,8 @@ defmodule PhoenixKitAI.Tasks do
 
   ## Fitness
 
-  `fitness/2` compares a task's hard needs (`:vision`, `:tools`,
-  `:json_schema`) with `PhoenixKitAI.Capabilities.for_endpoint/1` (the
+  `fitness/2` compares a task's hard needs (`:vision`, `:file_input`,
+  `:image_output`, `:tools`, `:json_schema`) with `PhoenixKitAI.Capabilities.for_endpoint/1` (the
   catalogue, the endpoint's declaration filling what it does not know):
   `:fit`, `{:unfit, missing}` when the model says no to something, or
   `{:unknown, unclear}` when nobody knows. `:json` is soft — the module falls
@@ -33,6 +33,7 @@ defmodule PhoenixKitAI.Tasks do
   require Logger
 
   alias PhoenixKitAI.{Capabilities, Endpoint, TaskSpec}
+  alias PhoenixKitAI.Web.MessageShape
 
   @registry_key {__MODULE__, :registry}
   # How long a build in which a module's `ai_tasks/0` failed is kept before
@@ -172,15 +173,13 @@ defmodule PhoenixKitAI.Tasks do
   rescue
     error ->
       Logger.warning(
-        "[PhoenixKitAI] #{inspect(module)}.ai_tasks/0 failed: #{Exception.message(error)}"
+        "[PhoenixKitAI] #{inspect(module)}.ai_tasks/0 failed: #{inspect(error.__struct__)}"
       )
 
       :error
   catch
-    kind, reason ->
-      Logger.warning(
-        "[PhoenixKitAI] #{inspect(module)}.ai_tasks/0 failed: #{kind} #{inspect(reason, limit: 5)}"
-      )
+    kind, _reason ->
+      Logger.warning("[PhoenixKitAI] #{inspect(module)}.ai_tasks/0 failed: #{kind}")
 
       :error
   end
@@ -192,14 +191,15 @@ defmodule PhoenixKitAI.Tasks do
           %{
             spec
             | module: module,
-              needs: Enum.filter(List.wrap(spec.needs), &(&1 in TaskSpec.needs()))
+              needs: Enum.filter(List.wrap(spec.needs), &(&1 in TaskSpec.needs())),
+              user_limits: spec.user_limits != false
           }
         ]
 
       other ->
         Logger.warning(
           "[PhoenixKitAI] #{inspect(module)}.ai_tasks/0 returned an entry that is not a " <>
-            "%PhoenixKitAI.TaskSpec{} with a key: #{inspect(other, limit: 3)}"
+            "%PhoenixKitAI.TaskSpec{} with a key: #{MessageShape.describe(other)}"
         )
 
         []
@@ -241,9 +241,11 @@ defmodule PhoenixKitAI.Tasks do
     :ok
   end
 
-  @doc "A requirement in words: images, tools, JSON schema, JSON."
+  @doc "A requirement in words: images, documents, image generation, tools, JSON schema, JSON."
   @spec need_label(TaskSpec.need()) :: String.t()
   def need_label(:vision), do: gettext("images")
+  def need_label(:file_input), do: gettext("documents")
+  def need_label(:image_output), do: gettext("image generation")
   def need_label(:tools), do: gettext("tools")
   def need_label(:json_schema), do: gettext("JSON schema")
   def need_label(:json), do: gettext("JSON")
@@ -358,13 +360,11 @@ defmodule PhoenixKitAI.Tasks do
     |> Enum.uniq_by(& &1.uuid)
   rescue
     error ->
-      Logger.warning("[PhoenixKitAI] endpoints callback failed: #{Exception.message(error)}")
+      Logger.warning("[PhoenixKitAI] endpoints callback failed: #{inspect(error.__struct__)}")
       []
   catch
-    kind, reason ->
-      Logger.warning(
-        "[PhoenixKitAI] endpoints callback failed: #{kind} #{inspect(reason, limit: 5)}"
-      )
+    kind, _reason ->
+      Logger.warning("[PhoenixKitAI] endpoints callback failed: #{kind}")
 
       []
   end

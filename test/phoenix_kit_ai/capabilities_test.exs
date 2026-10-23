@@ -43,8 +43,10 @@ defmodule PhoenixKitAI.CapabilitiesTest do
 
       assert %Capabilities{prompt_price: nil} = Capabilities.from_openrouter(%{"id" => "x"})
 
-      assert %Capabilities{prompt_price: 0.0} =
+      assert %Capabilities{prompt_price: price} =
                Capabilities.from_openrouter(%{"pricing" => %{"prompt" => "0"}})
+
+      assert price == 0.0
     end
 
     test "an Anthropic row has a name and text output, and no price" do
@@ -248,6 +250,14 @@ defmodule PhoenixKitAI.CapabilitiesTest do
   end
 
   describe "catalogue_kind/2" do
+    test "legacy provider connection names keep their catalogue behind a proxy" do
+      assert Capabilities.catalogue_kind("openrouter:work", "https://gateway.example.com/v1") ==
+               :openrouter
+
+      assert Capabilities.catalogue_kind("anthropic:work", "https://gateway.example.com/v1") ==
+               :anthropic
+    end
+
     test "by the provider key or by the host of the base URL" do
       assert Capabilities.catalogue_kind("openrouter", nil) == :openrouter
       assert Capabilities.catalogue_kind(nil, "https://openrouter.ai/api/v1") == :openrouter
@@ -256,8 +266,8 @@ defmodule PhoenixKitAI.CapabilitiesTest do
     end
 
     test "every other provider has no catalogue" do
-      assert Capabilities.catalogue_kind("mistral", "https://api.mistral.ai/v1") == nil
-      assert Capabilities.catalogue_kind("deepseek", "https://api.deepseek.com") == nil
+      assert Capabilities.catalogue_kind("openai", "https://api.openai.com/v1") == nil
+      assert Capabilities.catalogue_kind("xai", "https://api.x.ai/v1") == nil
       assert Capabilities.catalogue_kind(nil, nil) == nil
     end
   end

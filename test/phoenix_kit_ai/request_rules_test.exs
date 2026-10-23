@@ -125,6 +125,24 @@ defmodule PhoenixKitAI.RequestRulesTest do
     :ok
   end
 
+  test "a parameter-routing refusal does not log the provider's echoed content" do
+    secret = "private-prompt-and-key"
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, {:no_provider_for_params, []}} =
+                 Completion.handle_error_status(
+                   404,
+                   Jason.encode!(%{
+                     "error" => %{"message" => "No endpoints for requested parameters: #{secret}"}
+                   })
+                 )
+      end)
+
+    assert log =~ "requested parameters"
+    refute log =~ secret
+  end
+
   defp answer(content \\ "ok") do
     %{
       "model" => "m",
@@ -182,7 +200,7 @@ defmodule PhoenixKitAI.RequestRulesTest do
     endpoint
   end
 
-  defp anthropic_endpoint(attrs \\ %{}) do
+  defp anthropic_endpoint(attrs) do
     endpoint(
       Map.merge(
         %{provider: "anthropic", base_url: @anthropic, model: "claude-takes-disabled"},
@@ -226,7 +244,9 @@ defmodule PhoenixKitAI.RequestRulesTest do
 
     test "a caller's own temperature or top_p is sent, never both; penalties never" do
       stub()
-      ep = anthropic_endpoint()
+      # A model before Claude Opus 4.7: the later ones take neither
+      # (`AnthropicRulesTest`).
+      ep = anthropic_endpoint(%{model: "claude-sonnet-4-6"})
 
       assert {:ok, _} = PhoenixKitAI.ask(ep.uuid, "hi", temperature: 1.0)
       assert %{"temperature" => 1.0} = sent_body()
@@ -372,41 +392,6 @@ defmodule PhoenixKitAI.RequestRulesTest do
 
       assert {:ok, _} = PhoenixKitAI.ask(ep.uuid, "hi")
       assert %{"thinking" => %{"type" => "between_tools"}} = sent_body()
-    end
-
-    test "an Anthropic answer is priced from the rate table, another provider's is not" do
-      stub(
-        200,
-        %{answer() | "model" => "claude-sonnet-5-5"}
-        |> Map.put("usage", %{
-          "prompt_tokens" => 1000,
-          "completion_tokens" => 500,
-          "total_tokens" => 1500
-        })
-      )
-
-      ep = anthropic_endpoint(%{model: "claude-sonnet-5-5"})
-      other = endpoint(%{model: "vendor/other"})
-
-      assert {:ok, response} = PhoenixKitAI.ask(ep.uuid, "hi")
-      # $2 and $10 per million tokens: 1000 in, 500 out.
-      assert_in_delta response["usage"]["cost"], 0.007, 1.0e-12
-      _ = sent_body()
-
-      assert {:ok, response} = PhoenixKitAI.ask(other.uuid, "hi")
-      refute Map.has_key?(response["usage"], "cost")
-      _ = sent_body()
-
-      costs =
-        TestRepo.all(
-          from(r in Request,
-            where: r.endpoint_uuid in ^[ep.uuid, other.uuid],
-            select: {r.endpoint_uuid, r.cost_cents}
-          )
-        )
-
-      assert {ep.uuid, 7000} in costs
-      assert {other.uuid, nil} in costs
     end
 
     test "other providers keep the endpoint's values and the reasoning object" do

@@ -121,10 +121,13 @@ defmodule PhoenixKitAI do
   alias PhoenixKit.Utils.Reorder
   alias PhoenixKit.Utils.UUID, as: UUIDUtils
   alias PhoenixKitAI.{Budget, Endpoint, Prompt, Provider, RequestCache, StructuredOutput}
+  alias PhoenixKitAI.CallCost
   alias PhoenixKitAI.Capabilities
   alias PhoenixKitAI.Guard
+  alias PhoenixKitAI.GuardBlocks
   alias PhoenixKitAI.GuardEvents
   alias PhoenixKitAI.Images.{ImageModel, ImageModels, Operations}
+  alias PhoenixKitAI.ManualPrice
   alias PhoenixKitAI.Request
   alias PhoenixKitAI.TaskLimits
   alias PhoenixKitAI.Tasks
@@ -946,7 +949,8 @@ defmodule PhoenixKitAI do
       icon: "hero-sparkles",
       description: "AI endpoints, prompts, and usage tracking",
       # `ai.manage`: changes to the AI task guard (limits, watchers, "only
-      # verified models", forgiving a limit). Core grants a new
+      # verified models", forgiving a limit, blocks) and the reasons of a
+      # private task's flags and blocks. Core grants a new
       # sub-permission to Admin once while Admin holds `ai`; an Owner holds
       # every key.
       sub_permissions: [
@@ -954,7 +958,7 @@ defmodule PhoenixKitAI do
           key: "manage",
           label: "Manage the AI task guard",
           description:
-            "Change the limits of AI tasks, who is told about them, and which models may be used"
+            "Change the limits of AI tasks, who is told about them and which models may be used; block a person from a task; see why a private task's request was flagged"
         }
       ],
       # Renders the label translated in the admin permissions matrix, the
@@ -967,8 +971,10 @@ defmodule PhoenixKitAI do
   @doc """
   The notification type of the module: `"ai_guard"`, what the watchers of
   the AI task guard get when a task's limit is near or reached, a spending
-  cap refuses a call, or a task's model stops fitting it
-  (`PhoenixKitAI.GuardEvents`). A watcher can switch it off for themselves.
+  cap refuses a call, a task's model stops fitting it, a person's request is
+  flagged as off-purpose (once a day), a task's anomaly rule is broken, or a
+  person is blocked or unblocked (`PhoenixKitAI.GuardEvents`). A watcher can
+  switch it off for themselves.
   """
   @impl PhoenixKit.Module
   @spec notification_types() :: [map()]
@@ -979,7 +985,7 @@ defmodule PhoenixKitAI do
         label: gettext("AI task guard"),
         description:
           gettext(
-            "An AI task is near or at a limit, a spending cap refused a call, or a task's model no longer fits it"
+            "An AI task is near or at a limit, a spending cap refused a call, a task's model no longer fits it, a request was flagged as off-purpose, a task is used unusually, or a person was blocked or unblocked"
           ),
         actions: [],
         default: true
@@ -1111,7 +1117,7 @@ defmodule PhoenixKitAI do
       dgettext_noop("default", "Manage the AI task guard"),
       dgettext_noop(
         "default",
-        "Change the limits of AI tasks, who is told about them, and which models may be used"
+        "Change the limits of AI tasks, who is told about them and which models may be used; block a person from a task; see why a private task's request was flagged"
       )
     ]
   end
@@ -1465,7 +1471,28 @@ defmodule PhoenixKitAI do
   def resolve_endpoint(_), do: {:error, :invalid_endpoint_identifier}
 
   @doc """
+  Whether calls on `endpoint` get a cost in the usage journal: its provider
+  reports one (OpenRouter), or the operator's catalogue, the endpoint's
+  manual price (`provider_settings["pricing"]`) or the built-in Anthropic
+  rates price its model. Where it is false, money limits and the daily
+  budget cannot count the endpoint's calls. The order the sources are tried
+  in is `PhoenixKitAI.CallCost`'s. It speaks for chat, embeddings and the
+  vision verbs; making or editing images counts only the provider's own
+  cost.
+  """
+  @spec reports_cost?(Endpoint.t()) :: boolean()
+  def reports_cost?(%Endpoint{} = endpoint), do: CallCost.reports_cost?(endpoint)
+
+  @doc """
   Creates a new AI endpoint.
+
+  A manual price in `provider_settings["pricing"]` (`PhoenixKitAI.ManualPrice`:
+  `%{"input" => µ$, "output" => µ$}` per 1M tokens, both halves, stamped with
+  the endpoint's model) steers the money limits, so setting one needs the
+  `:scope` option of a holder of `ai.manage` (an Owner always); without it
+  the call is `{:error, changeset}` with an error on `:provider_settings`.
+  A capability declaration needs the same while only verified models are
+  allowed.
 
   ## Examples
 
@@ -1484,10 +1511,12 @@ defmodule PhoenixKitAI do
     %Endpoint{}
     |> Endpoint.changeset(attrs)
     |> guard_declaration(%Endpoint{}, opts)
+    |> guard_pricing(%Endpoint{}, opts)
     |> repo().insert(log: false)
     |> broadcast_endpoint_change(:endpoint_created)
     |> log_endpoint_activity("endpoint.created", opts)
     |> log_capabilities_declaration(%Endpoint{}, opts)
+    |> log_pricing_change(%Endpoint{}, opts)
     |> refresh_capabilities(true)
     |> log_failed_endpoint_mutation("endpoint.created", opts)
   end
@@ -1498,12 +1527,27 @@ defmodule PhoenixKitAI do
   Accepts an `:actor_uuid` option so the mutation can be attributed in
   the activity feed. If the change toggles the `enabled` flag an
   additional `endpoint.enabled` / `endpoint.disabled` entry is logged.
+
+  Setting, changing or removing the manual price
+  (`provider_settings["pricing"]`, `PhoenixKitAI.ManualPrice`) needs the
+  `:scope` option of a holder of `ai.manage` (an Owner always); without it
+  the call is `{:error, changeset}` with an error on `:provider_settings`.
+  That includes replacing `provider_settings` wholesale without
+  `"pricing"` on an endpoint that has a price — merge the stored settings
+  instead. A model change drops the old model's price and needs nothing;
+  an update that leaves the price as it is needs nothing either.
   """
   @spec update_endpoint(Endpoint.t(), map(), keyword()) ::
           {:ok, Endpoint.t()} | {:error, Ecto.Changeset.t()}
   def update_endpoint(%Endpoint{} = endpoint, attrs, opts \\ []) do
     was_enabled = endpoint.enabled
-    changeset = endpoint |> Endpoint.changeset(attrs) |> guard_declaration(endpoint, opts)
+
+    changeset =
+      endpoint
+      |> Endpoint.changeset(attrs)
+      |> guard_declaration(endpoint, opts)
+      |> guard_pricing(endpoint, opts)
+
     # Skip the activity row when the update is a no-op (no field actually
     # changed). The toggle log keeps its own guard so an enable/disable
     # via a bare `%{enabled: x}` still attributes correctly.
@@ -1516,6 +1560,7 @@ defmodule PhoenixKitAI do
     |> maybe_log_endpoint_update(has_changes, opts)
     |> maybe_log_endpoint_toggle(was_enabled, opts)
     |> log_capabilities_declaration(endpoint, opts)
+    |> log_pricing_change(endpoint, opts)
     |> refresh_capabilities(catalogue_inputs_changed?(changeset))
     |> log_failed_endpoint_mutation("endpoint.updated", opts)
   end
@@ -1565,6 +1610,28 @@ defmodule PhoenixKitAI do
 
   defp log_capabilities_declaration(result, _before, _opts), do: result
 
+  # A manual price (`PhoenixKitAI.ManualPrice`) set, changed or removed is
+  # logged with the price before and after, in micro-dollars per 1M tokens.
+  defp log_pricing_change({:ok, endpoint} = result, before, opts) do
+    old = ManualPrice.get(before) || %{}
+    new = ManualPrice.get(endpoint) || %{}
+
+    if old != new do
+      log_activity("endpoint.pricing_changed", "endpoint", endpoint.uuid, opts, %{
+        "name" => endpoint.name,
+        "model" => endpoint.model,
+        "input_before" => old["input"],
+        "input_after" => new["input"],
+        "output_before" => old["output"],
+        "output_after" => new["output"]
+      })
+    end
+
+    result
+  end
+
+  defp log_pricing_change(result, _before, _opts), do: result
+
   # While only verified models may be used (`Guard.verified_only?/0`), what
   # an admin declares an endpoint's model can do decides which calls go
   # through, so a new or changed declaration needs `ai.manage` (the `:scope`
@@ -1589,6 +1656,30 @@ defmodule PhoenixKitAI do
       changeset
     end
   end
+
+  # A manual price steers the money limits (`PhoenixKitAI.ManualPrice`), so
+  # setting, changing or removing one needs `ai.manage` (the `:scope`
+  # option; an Owner always). A price dropped because the model changed
+  # needs nothing: it no longer applies.
+  defp guard_pricing(changeset, before, opts) do
+    new = changeset |> Ecto.Changeset.get_field(:provider_settings) |> stored_pricing()
+    old = stored_pricing(before.provider_settings)
+    model = Ecto.Changeset.get_field(changeset, :model)
+    dropped_stale? = new == nil and old != nil and old["model"] != model
+
+    if new != old and not dropped_stale? and not Guard.may_manage?(opts[:scope]) do
+      Ecto.Changeset.add_error(
+        changeset,
+        :provider_settings,
+        gettext("only a holder of ai.manage may set or change a manual price")
+      )
+    else
+      changeset
+    end
+  end
+
+  defp stored_pricing(%{"pricing" => %{} = pricing}), do: pricing
+  defp stored_pricing(_settings), do: nil
 
   defp capabilities_declaration(%Endpoint{provider_settings: %{"capabilities" => declaration}})
        when is_map(declaration) do
@@ -2543,6 +2634,7 @@ defmodule PhoenixKitAI do
       {:ok, request} ->
         emit_request_telemetry(request)
         dispatch_usage_sinks(request)
+        Guard.check_anomalies(request)
         {:ok, request}
 
       {:error, %Ecto.Changeset{} = changeset} = error ->
@@ -2875,7 +2967,7 @@ defmodule PhoenixKitAI do
   # fetch, and the zero-cost row a hit writes. Logging stays in the run_*
   # functions and the verbs' error branches.
   defp with_cache(verb, endpoint, opts, material, row, fun) do
-    model = opts[:model] || endpoint.model
+    model = sent_model(endpoint, opts, verb)
 
     key = fn ->
       material =
@@ -3681,7 +3773,8 @@ defmodule PhoenixKitAI do
           {:ok, %{images: [%{url: String.t() | nil, data: binary() | nil}]}} | {:error, term()}
   def generate_image(endpoint_uuid, prompt, opts \\ []) when is_binary(prompt) do
     with {:ok, endpoint} <- resolve_endpoint(endpoint_uuid),
-         {:ok, admission} <- authorize(endpoint, opts, :generate_image, []) do
+         {:ok, admission} <-
+           authorize(endpoint, opts, :generate_image, Guard.implied_needs(:generate_image, opts)) do
       {auto_source, stacktrace, caller_context} = capture_caller_info()
       source = Keyword.get(opts, :source) || auto_source
       caller_context = Map.put(caller_context, :user_uuid, opts[:user_uuid])
@@ -3735,7 +3828,8 @@ defmodule PhoenixKitAI do
   def edit_image(endpoint_uuid, prompt, images, opts \\ [])
       when is_binary(prompt) and is_list(images) do
     with {:ok, endpoint} <- resolve_endpoint(endpoint_uuid),
-         {:ok, admission} <- authorize(endpoint, opts, :edit_image, []) do
+         {:ok, admission} <-
+           authorize(endpoint, opts, :edit_image, Guard.implied_needs(:edit_image, opts)) do
       {auto_source, stacktrace, caller_context} = capture_caller_info()
       source = Keyword.get(opts, :source) || auto_source
       caller_context = Map.put(caller_context, :user_uuid, opts[:user_uuid])
@@ -3792,7 +3886,13 @@ defmodule PhoenixKitAI do
   def process_image(endpoint_uuid, images, operations, opts \\ []) when is_list(images) do
     with {:ok, endpoint} <- resolve_endpoint(endpoint_uuid),
          {:ok, admission} <-
-           authorize(endpoint, opts, :process_image, [], !Keyword.get(opts, :dry_run, false)) do
+           authorize(
+             endpoint,
+             opts,
+             :process_image,
+             Guard.implied_needs(:process_image, opts),
+             !Keyword.get(opts, :dry_run, false)
+           ) do
       {auto_source, stacktrace, caller_context} = capture_caller_info()
       source = Keyword.get(opts, :source) || auto_source
       caller_context = Map.put(caller_context, :user_uuid, opts[:user_uuid])
@@ -4151,8 +4251,8 @@ defmodule PhoenixKitAI do
       else: meta
   end
 
-  # One row per image verb (`image`, `image_edit`, `vision`): tokens and
-  # cost when the provider reports them, latency, counts and byte sizes of
+  # One row per image verb (`image`, `image_edit`, `vision`): tokens, the
+  # cost (`image_op_cost/5`), latency, counts and byte sizes of
   # the images — never the image bytes; prompt and any text under the PII
   # gate. `trace` comes from `trace/4`.
   defp log_image_op_request(endpoint, type, prompt, images, result, extra, trace) do
@@ -4175,10 +4275,13 @@ defmodule PhoenixKitAI do
       })
       |> Map.merge(trace_metadata(trace))
 
+    {cost, cost_metadata} = image_op_cost(type, endpoint, result, usage, trace)
+
     metadata =
       base_metadata
       |> maybe_add_content(:input, capture_content, fn -> prompt end)
       |> maybe_add_content(:response, capture_content, fn -> result[:text] end)
+      |> Map.merge(cost_metadata)
 
     create_request(%{
       endpoint_uuid: endpoint.uuid,
@@ -4188,13 +4291,31 @@ defmodule PhoenixKitAI do
       input_tokens: usage[:prompt_tokens] || 0,
       output_tokens: usage[:completion_tokens] || 0,
       total_tokens: usage[:total_tokens] || 0,
-      cost_cents: usage[:cost_cents],
+      cost_cents: cost,
       latency_ms: result[:latency_ms],
       status: "success",
       user_uuid: trace[:user_uuid],
       metadata: metadata
     })
   end
+
+  # A vision call is a chat call with images, priced like one (`CallCost`):
+  # the model the answer names, else the one sent — the call's `model:`,
+  # else the endpoint's (a manual price is its own model's, so it does not
+  # price a call sent to another). Making or editing images is priced per
+  # image or per call, which a price per token does not fit: there only the
+  # provider's own cost counts.
+  defp image_op_cost("vision", endpoint, result, usage, trace) do
+    CallCost.for_call(
+      %{endpoint | model: trace[:model] || endpoint.model},
+      result[:model],
+      usage[:cost_cents],
+      usage[:prompt_tokens],
+      usage[:completion_tokens]
+    )
+  end
+
+  defp image_op_cost(_type, _endpoint, _result, usage, _trace), do: {usage[:cost_cents], %{}}
 
   defp log_failed_image_op_request(endpoint, type, prompt, images, reason, trace) do
     capture_content = capture_request_content?(trace[:capture])
@@ -4314,9 +4435,15 @@ defmodule PhoenixKitAI do
     :process_image
   ]
 
+  defp sent_model(endpoint, opts, verb) do
+    if verb in @model_override_verbs, do: opts[:model] || endpoint.model, else: endpoint.model
+  end
+
   # Every provider-calling verb passes here, in this order: the endpoint
-  # must be usable; [the task's block on the user — a later part of the
-  # guard — goes here]; the model must fit what the call and its task need
+  # must be usable; the user must not be blocked from the task's group
+  # (`GuardBlocks.check/2`, skipped for a call that holds an admission of
+  # `Guard.admit/4`, which checked it); the model must fit what the call
+  # and its task need
   # (`Guard.check/4`, `implied` being what the call itself shows); the
   # task's own limits (`TaskLimits.check/3`, skipped for a call that holds
   # an admission of `Guard.admit/4` for its task and user); when caps are
@@ -4327,8 +4454,8 @@ defmodule PhoenixKitAI do
   # `spends?` is false only for a `process_image/4` dry run, the one verb
   # that honours `dry_run:` — reading the option here let every other verb
   # skip the cap and still call the provider. A dry run still has its
-  # fitness checked; it skips the spend caps and the task's limits (and will
-  # skip its blocks).
+  # fitness checked; it skips the spend caps, the task's limits and its
+  # blocks.
   #
   # A refusal after the endpoint check is written as a usage row by
   # `refuse/4`; an unusable endpoint is not (that is a configuration error,
@@ -4349,11 +4476,20 @@ defmodule PhoenixKitAI do
   defp admit(endpoint, opts, implied, spends?) do
     task = Tasks.for_call(opts[:task])
 
-    with {:ok, admission} <- Guard.check(endpoint, opts, task, implied),
+    with :ok <- if(spends?, do: blocks(task, opts), else: :ok),
+         {:ok, admission} <- Guard.check(endpoint, opts, task, implied),
          :ok <- if(spends?, do: task_limits(task, opts), else: :ok),
          :ok <- if(spends?, do: budget(endpoint, opts), else: :ok) do
       {:ok, admission}
     end
+  end
+
+  defp blocks(nil, _opts), do: :ok
+
+  defp blocks(task, opts) do
+    if Guard.admitted?(opts[:guard_admission], task.key, opts[:user_uuid]),
+      do: :ok,
+      else: GuardBlocks.check(task, opts[:user_uuid])
   end
 
   defp task_limits(nil, _opts), do: :ok
@@ -4509,8 +4645,9 @@ defmodule PhoenixKitAI do
   # `top_p` or `top_k` its newer models do not take, and ignores the
   # penalties and `seed`: the endpoint's stored sampling values (the
   # schema's 0.7 default among them) are not sent there. A caller's own
-  # `temperature:` / `top_p:` / `top_k:` still is; `Completion` never sends
-  # `temperature` and `top_p` together.
+  # `temperature:` / `top_p:` / `top_k:` still is, except that `Completion`
+  # never sends `temperature` and `top_p` together, nor either of them to a
+  # model from Claude Opus 4.7 on.
   defp caller_only_options(endpoint) do
     if Completion.anthropic?(endpoint),
       do: [
@@ -4682,6 +4819,10 @@ defmodule PhoenixKitAI do
         Map.put(base_metadata, :content_redacted, true)
       end
 
+    # The provider's cost, else a catalogue, manual or table price for the
+    # model the answer names (`CallCost`).
+    {cost, cost_metadata} = call_cost(endpoint, response, usage, usage.completion_tokens)
+
     create_request(%{
       endpoint_uuid: endpoint.uuid,
       endpoint_name: endpoint.name,
@@ -4692,11 +4833,11 @@ defmodule PhoenixKitAI do
       input_tokens: usage.prompt_tokens,
       output_tokens: usage.completion_tokens,
       total_tokens: usage.total_tokens,
-      cost_cents: usage.cost_cents,
+      cost_cents: cost,
       latency_ms: response["latency_ms"],
       status: "success",
       user_uuid: caller_context[:user_uuid],
-      metadata: metadata
+      metadata: Map.merge(metadata, cost_metadata)
     })
   end
 
@@ -4788,6 +4929,8 @@ defmodule PhoenixKitAI do
     usage = Completion.extract_usage(response)
     input_count = if is_list(input), do: length(input), else: 1
 
+    {cost, cost_metadata} = call_cost(endpoint, response, usage, 0)
+
     create_request(%{
       endpoint_uuid: endpoint.uuid,
       endpoint_name: endpoint.name,
@@ -4795,7 +4938,7 @@ defmodule PhoenixKitAI do
       request_type: "embedding",
       input_tokens: usage.prompt_tokens,
       total_tokens: usage.total_tokens,
-      cost_cents: usage.cost_cents,
+      cost_cents: cost,
       latency_ms: response["latency_ms"],
       status: "success",
       user_uuid: caller_context[:user_uuid],
@@ -4809,10 +4952,24 @@ defmodule PhoenixKitAI do
             stacktrace: stacktrace,
             caller_context: caller_context
           },
-          guard
+          Map.merge(guard, cost_metadata)
         )
     })
   end
+
+  # A call's cost from `CallCost`. An answer without `usage` says nothing
+  # about the call's size: no cost, rather than a priced $0.
+  defp call_cost(endpoint, %{"usage" => %{}} = response, usage, output_tokens) do
+    CallCost.for_call(
+      endpoint,
+      response["model"],
+      usage.cost_cents,
+      usage.prompt_tokens,
+      output_tokens
+    )
+  end
+
+  defp call_cost(_endpoint, _response, _usage, _output_tokens), do: {nil, %{}}
 
   defp log_failed_embedding_request(endpoint, reason, {source, stacktrace, caller_context, guard}) do
     create_request(%{

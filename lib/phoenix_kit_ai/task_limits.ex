@@ -15,8 +15,8 @@ defmodule PhoenixKitAI.TaskLimits do
   calendar day and month of the site time zone (Settings → `time_zone`,
   `PhoenixKit.Utils.TimeZone`), each from its local midnight to the next.
 
-  A limit is an amount per (unit, period). An empty one is no limit; `0`
-  allows nothing.
+  A limit is an amount per (unit, period). An empty cell inherits the next
+  layer's default; with no default there is no limit. `0` allows nothing.
 
   ## Which limit is in force
 
@@ -29,6 +29,11 @@ defmodule PhoenixKitAI.TaskLimits do
     * `:task` — the task's own (`limits["task"]`), then the declaration's
       `default_limits.task`.
 
+  A task declared with `user_limits: false` (its module limits its users
+  itself) has no `:user` scope here: the declaration's and the stored user
+  values are ignored (and kept), and setting a user limit or forgiving one is
+  `{:error, :user_limits_off}`.
+
   ## What is counted
 
   The task's rows of the journal (`phoenix_kit_ai_requests`,
@@ -36,9 +41,12 @@ defmodule PhoenixKitAI.TaskLimits do
   call costs nothing and a refusal is an error row, so neither counts. Money
   is the `cost_cents` sum, tokens the `total_tokens` sum, requests the rows —
   so a cached answer (a zero-cost success row) counts as one request and no
-  money or tokens. Money is only what the provider reports: an endpoint that
-  does not report a call's cost (`money_counted?/1`) adds nothing to it, and
-  there requests and tokens are what limits a task.
+  money or tokens. Money is what a row's cost says (`PhoenixKitAI.CallCost`:
+  the provider's own cost, else a catalogue, the endpoint's manual or the
+  built-in Anthropic price, `metadata.cost_source`; the vision verbs are
+  priced like chat, making or editing images only by the provider's own
+  cost): an endpoint none of them prices (`money_counted?/2`) adds nothing
+  to it, and there requests and tokens are what limits a task.
 
   ## The check
 
@@ -100,6 +108,8 @@ defmodule PhoenixKitAI.TaskLimits do
   @default_warn_percent 80
   @topic "phoenix_kit:ai:guard"
   @cache_ttl_ms :timer.seconds(60)
+  # What the Tasks page sets; the classifier modes come with the classifier.
+  @settable_modes ~w(off self_flag)
 
   @type scope :: :task | :user
   @type unit :: :money | :requests | :tokens
@@ -113,7 +123,8 @@ defmodule PhoenixKitAI.TaskLimits do
           used: non_neg_integer(),
           limit: non_neg_integer(),
           period_key: String.t(),
-          ends_at: DateTime.t()
+          ends_at: DateTime.t(),
+          forgiven_at: DateTime.t() | nil
         }
 
   @doc "The scopes, units and periods, in the order they are checked."
@@ -174,7 +185,7 @@ defmodule PhoenixKitAI.TaskLimits do
     declared = normalize_scoped(spec.default_limits)
 
     user =
-      if is_binary(user_uuid),
+      if is_binary(user_uuid) and spec.user_limits != false,
         do: merge([Map.get(personal, user_uuid, %{}), stored.user, declared.user]),
         else: %{}
 
@@ -185,7 +196,8 @@ defmodule PhoenixKitAI.TaskLimits do
   What a task's settings and its declaration say, layer by layer, for a page
   that edits them: `stored` (the settings row), `declared`
   (`default_limits`) and `defaults` (the two merged — the task's limits and
-  the limits of a user without a personal exception).
+  the limits of a user without a personal exception). The user parts are
+  empty for a task declared with `user_limits: false`.
   """
   @spec layers(TaskSpec.t()) :: %{
           setting: TaskSetting.t() | nil,
@@ -195,8 +207,8 @@ defmodule PhoenixKitAI.TaskLimits do
         }
   def layers(%TaskSpec{} = spec) do
     setting = settings(spec.key)
-    stored = stored_limits(setting)
-    declared = normalize_scoped(spec.default_limits)
+    stored = setting |> stored_limits() |> user_part(spec)
+    declared = spec.default_limits |> normalize_scoped() |> user_part(spec)
 
     %{
       setting: setting,
@@ -229,16 +241,28 @@ defmodule PhoenixKitAI.TaskLimits do
   end
 
   @doc """
-  Whether a chat call's money counts on `endpoint`: only a provider that
-  reports a call's cost writes one (today OpenRouter). Speech is priced by
+  Whether the money of a task's calls counts on `endpoint`. For chat and for
+  a task that reads images (`needs` without `:image_output`; the vision
+  verbs are chat calls with images, priced the same way): some source prices
+  its calls (`PhoenixKitAI.reports_cost?/1` — the provider's own cost, a
+  catalogue, manual or built-in price). A task that makes images
+  (`:image_output` among `needs`) may call the image-making verbs, priced
+  per image or per call, which only the provider's own cost prices
+  (OpenRouter): a manual or built-in price, per token, does not count there.
+  A caller asking for `[:vision]` gets the chat answer. Speech is priced by
   `PhoenixKitAI.TtsPricing` on other providers too; an endpoint does not say
-  which kind it is, so this answers for chat.
+  which kind it is.
   """
-  @spec money_counted?(Endpoint.t()) :: boolean()
-  def money_counted?(%Endpoint{provider: provider}) when is_binary(provider),
-    do: Endpoint.base_provider(provider) == "openrouter"
+  @spec money_counted?(Endpoint.t(), [TaskSpec.need()]) :: boolean()
+  def money_counted?(endpoint, needs \\ [])
 
-  def money_counted?(_endpoint), do: false
+  def money_counted?(%Endpoint{provider: provider} = endpoint, needs) when is_binary(provider) do
+    if :image_output in needs,
+      do: Endpoint.base_provider(provider) == "openrouter",
+      else: PhoenixKitAI.reports_cost?(endpoint)
+  end
+
+  def money_counted?(_endpoint, _needs), do: false
 
   # ── the per-node cache (see the moduledoc) ──
 
@@ -274,6 +298,13 @@ defmodule PhoenixKitAI.TaskLimits do
   rescue
     ArgumentError -> :ok
   end
+
+  @doc false
+  # The task's settings row from this node's cache (nil when none): what
+  # the guard reads per call besides the limits (the guard mode, the
+  # purpose override).
+  @spec cached_setting(String.t()) :: TaskSetting.t() | nil
+  def cached_setting(task_key) when is_binary(task_key), do: cached(task_key).setting
 
   defp cached(task_key) do
     table = flags_table()
@@ -320,6 +351,10 @@ defmodule PhoenixKitAI.TaskLimits do
 
   defp stored_limits(%TaskSetting{limits: limits}), do: normalize_scoped(limits)
   defp stored_limits(nil), do: %{task: %{}, user: %{}}
+
+  # The user part of scoped limits, empty when the task has no user scope.
+  defp user_part(scoped, %TaskSpec{user_limits: false}), do: %{scoped | user: %{}}
+  defp user_part(scoped, %TaskSpec{}), do: scoped
 
   # The first layer that sets a cell wins.
   defp merge(layers) do
@@ -384,14 +419,16 @@ defmodule PhoenixKitAI.TaskLimits do
   @doc """
   What the task (and `user_uuid` in it, when given) used in the day and month
   of `now`, from the moment a limit was forgiven when it was:
-  `%{task: %{unit => %{day:, month:}}, user: … | nil}`.
+  `%{task: %{unit => %{day:, month:}}, user: … | nil}`. The user is counted
+  for any task, also one declared with `user_limits: false`, where that
+  count limits nothing.
   """
   @spec usage(String.t(), String.t() | nil, DateTime.t()) :: %{
           task: %{unit() => %{period() => non_neg_integer()}},
           user: %{unit() => %{period() => non_neg_integer()}} | nil
         }
   def usage(task_key, user_uuid, now \\ DateTime.utc_now()) when is_binary(task_key),
-    do: usage(task_key, user_uuid, now, true)
+    do: task_key |> usage(user_uuid(user_uuid), now, true) |> Map.delete(:forgiven)
 
   # The task's count is skipped when no task limit needs it.
   defp usage(task_key, user_uuid, now, task?) do
@@ -400,7 +437,8 @@ defmodule PhoenixKitAI.TaskLimits do
 
     %{
       task: if(task?, do: count(task_key, nil, windows, forgiven)),
-      user: if(is_binary(user_uuid), do: count(task_key, user_uuid, windows, forgiven))
+      user: if(is_binary(user_uuid), do: count(task_key, user_uuid, windows, forgiven)),
+      forgiven: forgiven
     }
   end
 
@@ -506,6 +544,7 @@ defmodule PhoenixKitAI.TaskLimits do
   """
   @spec statuses(TaskSpec.t(), String.t() | nil, DateTime.t()) :: [status()]
   def statuses(%TaskSpec{} = spec, user_uuid, now \\ DateTime.utc_now()) do
+    user_uuid = user_uuid(user_uuid)
     statuses(spec.key, effective(spec, user_uuid), user_uuid, now)
   end
 
@@ -532,7 +571,8 @@ defmodule PhoenixKitAI.TaskLimits do
           used: used[unit][period],
           limit: limit,
           period_key: keys[period],
-          ends_at: elem(windows[period], 1)
+          ends_at: elem(windows[period], 1),
+          forgiven_at: usage.forgiven[{scope, period}]
         }
       end
     end
@@ -551,7 +591,7 @@ defmodule PhoenixKitAI.TaskLimits do
   def check(nil, _opts, _now), do: :ok
 
   def check(%TaskSpec{} = spec, opts, now) do
-    user_uuid = if is_binary(opts[:user_uuid]), do: opts[:user_uuid]
+    user_uuid = user_uuid(opts[:user_uuid])
     entry = cached(spec.key)
     statuses = statuses(spec.key, effective(spec, entry, user_uuid), user_uuid, now)
 
@@ -576,7 +616,23 @@ defmodule PhoenixKitAI.TaskLimits do
       )
 
       :ok
+  catch
+    :exit, _reason ->
+      Logger.warning("[PhoenixKitAI] task limits of #{inspect(spec.key)} not checked: exit")
+      :ok
   end
+
+  # A caller may pass a visitor's own id as `user_uuid:`; the journal's
+  # column is a uuid, so such a call is held to the task's limits alone
+  # instead of the count raising and the whole check failing open.
+  defp user_uuid(value) when is_binary(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, uuid} -> uuid
+      :error -> nil
+    end
+  end
+
+  defp user_uuid(_value), do: nil
 
   defp user_for(%{scope: :user}, user_uuid), do: user_uuid
   defp user_for(_status, _user_uuid), do: nil
@@ -590,14 +646,22 @@ defmodule PhoenixKitAI.TaskLimits do
   (`%{"task" => …, "user" => …}`, see the moduledoc; amounts as numbers or
   strings, blank for none) and `"warn_percent"` (1–100, blank for the
   default). Needs `ai.manage`; written to the Activity log.
+
+  For a task declared with `user_limits: false` a user amount is refused
+  (`{:error, :user_limits_off}`, blank ones are not amounts) and the user
+  values stored before are kept as they are.
   """
   @spec update_settings(term(), String.t(), map()) ::
-          {:ok, TaskSetting.t()} | {:error, :forbidden | :unknown_task | Ecto.Changeset.t()}
+          {:ok, TaskSetting.t()}
+          | {:error, :forbidden | :unknown_task | :user_limits_off | Ecto.Changeset.t()}
   def update_settings(scope, task_key, attrs) when is_binary(task_key) and is_map(attrs) do
+    limits = attrs |> fetch(:limits) |> normalize_scoped()
+
     with :ok <- Guard.authorize_manage(scope),
-         :ok <- declared(task_key) do
-      limits = attrs |> fetch(:limits) |> normalize_scoped() |> stringify_scoped()
+         {:ok, spec} <- declared_spec(task_key),
+         :ok <- if(limits.user == %{}, do: :ok, else: user_scope(spec)) do
       setting = settings(task_key) || %TaskSetting{task_key: task_key}
+      limits = limits |> stringify_scoped() |> keep_stored_user(spec, setting)
 
       setting
       |> Ecto.Changeset.change(%{
@@ -609,6 +673,7 @@ defmodule PhoenixKitAI.TaskLimits do
         greater_than_or_equal_to: 1,
         less_than_or_equal_to: 100
       )
+      |> Ecto.Changeset.unique_constraint(:task_key)
       |> repo().insert_or_update()
       |> changed(task_key)
       |> log("guard.limits_updated", scope, fn row ->
@@ -623,19 +688,64 @@ defmodule PhoenixKitAI.TaskLimits do
     end
   end
 
+  # A task without the user scope keeps the user values stored before, as
+  # they are.
+  defp keep_stored_user(limits, %TaskSpec{user_limits: false}, %TaskSetting{
+         limits: %{"user" => user}
+       }),
+       do: Map.put(limits, "user", user)
+
+  defp keep_stored_user(limits, _spec, _setting), do: limits
+
+  @doc """
+  Sets a task's guard mode: `"self_flag"` (its consumer has the model flag
+  off-purpose requests) or `"off"` — what `PhoenixKitAI.Guard.self_flag?/1`
+  answers from then on, in place of the declaration's `self_flag`. The
+  limits stay as they are. Needs `ai.manage`; written to the Activity log.
+  """
+  @spec set_guard_mode(term(), String.t(), String.t()) ::
+          {:ok, TaskSetting.t()}
+          | {:error, :forbidden | :unknown_task | :invalid_mode | Ecto.Changeset.t()}
+  def set_guard_mode(scope, task_key, mode) when is_binary(task_key) do
+    with :ok <- Guard.authorize_manage(scope),
+         :ok <- declared(task_key),
+         :ok <- if(mode in @settable_modes, do: :ok, else: {:error, :invalid_mode}) do
+      setting = settings(task_key) || %TaskSetting{task_key: task_key}
+
+      setting
+      |> Ecto.Changeset.change(%{guard_mode: mode, updated_by_uuid: Guard.actor_uuid(scope)})
+      |> repo().insert_or_update()
+      |> changed(task_key)
+      |> log("guard.mode_updated", scope, fn row ->
+        %{
+          "task" => task_key,
+          "guard_mode" => row.guard_mode,
+          "guard_mode_before" => setting.guard_mode
+        }
+      end)
+    end
+  end
+
   @doc """
   Sets a user's personal limits in a task (`%{unit => %{period => amount}}`);
   with no amount left the exception is removed. Needs `ai.manage`; written to
-  the Activity log.
+  the Activity log. `{:error, :user_limits_off}` for a task declared with
+  `user_limits: false`.
   """
   @spec put_user_limits(term(), String.t(), String.t(), map()) ::
           {:ok, TaskUserLimit.t() | :deleted}
           | {:error,
-             :forbidden | :unknown_task | :invalid_user | :unknown_user | Ecto.Changeset.t()}
+             :forbidden
+             | :unknown_task
+             | :user_limits_off
+             | :invalid_user
+             | :unknown_user
+             | Ecto.Changeset.t()}
   def put_user_limits(scope, task_key, user_uuid, limits)
       when is_binary(task_key) and is_map(limits) do
     with :ok <- Guard.authorize_manage(scope),
-         :ok <- declared(task_key),
+         {:ok, spec} <- declared_spec(task_key),
+         :ok <- user_scope(spec),
          {:ok, user_uuid} <- user(user_uuid) do
       case normalize(limits) do
         empty when empty == %{} -> delete_user_limits(scope, task_key, user_uuid)
@@ -653,6 +763,7 @@ defmodule PhoenixKitAI.TaskLimits do
 
     row
     |> Ecto.Changeset.change(%{limits: stringify(limits)})
+    |> Ecto.Changeset.unique_constraint([:task_key, :user_uuid])
     |> Ecto.Changeset.foreign_key_constraint(:user_uuid,
       name: :phoenix_kit_ai_task_user_limits_user_uuid_fkey
     )
@@ -697,15 +808,18 @@ defmodule PhoenixKitAI.TaskLimits do
   @doc """
   Forgives the `limit_scope` (`:task`, or `:user` with `user_uuid`) limit of
   `period` from `now`: its count starts again from then to the end of the
-  window. Kept as a `limit_forgiven` event. Needs `ai.manage`.
+  window. Kept as a `limit_forgiven` event. Needs `ai.manage`. A user's
+  limit is `{:error, :user_limits_off}` for a task declared with
+  `user_limits: false`.
   """
   @spec forgive(term(), String.t(), scope(), period(), String.t() | nil, DateTime.t()) ::
           {:ok, GuardEvent.t()} | {:error, term()}
   def forgive(scope, task_key, limit_scope, period, user_uuid, now \\ DateTime.utc_now())
       when is_binary(task_key) do
     with :ok <- Guard.authorize_manage(scope),
-         :ok <- declared(task_key),
+         {:ok, spec} <- declared_spec(task_key),
          {:ok, limit_scope} <- known(limit_scope, @scopes),
+         :ok <- if(limit_scope == :user, do: user_scope(spec), else: :ok),
          {:ok, period} <- known(period, @periods),
          {:ok, user_uuid} <- forgiven_user(limit_scope, user_uuid) do
       GuardEvents.limit_forgiven(
@@ -725,7 +839,19 @@ defmodule PhoenixKitAI.TaskLimits do
   defp forgiven_user(:task, _user_uuid), do: {:ok, nil}
   defp forgiven_user(:user, user_uuid), do: user(user_uuid)
 
-  defp declared(task_key), do: if(Tasks.get(task_key), do: :ok, else: {:error, :unknown_task})
+  defp declared(task_key) do
+    with {:ok, _spec} <- declared_spec(task_key), do: :ok
+  end
+
+  defp declared_spec(task_key) do
+    case Tasks.get(task_key) do
+      nil -> {:error, :unknown_task}
+      spec -> {:ok, spec}
+    end
+  end
+
+  defp user_scope(%TaskSpec{user_limits: false}), do: {:error, :user_limits_off}
+  defp user_scope(%TaskSpec{}), do: :ok
 
   # A uuid of a user that exists; a uuid of nobody is `:unknown_user`, not a
   # foreign-key error later.
