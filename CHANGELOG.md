@@ -1,3 +1,77 @@
+## Unreleased
+
+### Changed
+
+- The migration chain is now V5 and adopts `phoenix_kit_ai_endpoints`,
+  `phoenix_kit_ai_prompts` and `phoenix_kit_ai_requests`, which core's chain
+  created before the module had one (core's V135 baseline plus V164, V169,
+  V193 and V223). `CREATE TABLE IF NOT EXISTS`, guarded constraints and
+  indexes, identical to what a fresh core builds: a no-op on every existing
+  install. The adoption runs ahead of V2's statements, because V2 and V4 touch
+  those tables. `down/1` never drops them. With it the chain builds all eight
+  tables without core (`test/integration/migrations_build_alone_test.exs`,
+  core's `ModuleChainCheck`). A change to these tables is now a version here,
+  never a core migration. See core's
+  `dev_docs/plans/2026-10-25-module-table-ownership.md`.
+
+## 0.26.1 - 2026-10-24
+
+### Fixed
+
+- The Playground shows a call's logged cost under `request_log_mode: :async` too
+  (#56). A cost known only from the usage row (Anthropic's list price, a catalogue
+  or manual price) used to vanish because the row was still queued; the Playground
+  now waits once, up to 2 s, for the queue before reading it. Synchronous logging
+  and a full queue take the old path.
+
+### Changed
+
+- Dependencies updated: PhoenixKit 2.64.1.
+
+## 0.26.0 - 2026-10-24
+
+Requires PhoenixKit `~> 2.64`. Upgrade both packages together, then run
+`mix phoenix_kit.update`: core V223 converts the request journal and this module's
+V4 converts spend caps, task money limits and manual prices from legacy
+millionths into dollar strings. Custom callers must pass dollar strings or
+`Decimal` amounts instead of scaled integers.
+
+### Added
+
+- AI tasks declare required model capabilities, with model recommendations,
+  endpoint declarations and a cached capability catalogue.
+- Task guard checks capabilities before calling a provider, supports verified-only
+  operation, private off-purpose flags, blocks, watchers and activity notifications.
+  `ai.manage` controls guard changes and sensitive reasons.
+- Task and per-user limits track requests, tokens and dollars across calendar
+  periods, with warnings, overrides and explicit forgiveness. A task may disable
+  its per-user limits.
+- Chat tool calling preserves tool calls and tool results across rounds, including
+  JSON/schema response modes, and records the calls in the usage journal.
+- Concurrency limits with queued admission, retry backoff, per-call model selection,
+  endpoint/credential lookup caches and optional asynchronous request logging.
+- Manual per-million-token pricing for models whose catalogue has no price.
+
+### Changed
+
+- Costs, prices and spend caps use decimal dollars throughout. Usage costs retain
+  18 decimal places; ambiguous legacy numeric settings fail closed until migrated.
+- Provider models, headers and capability rules follow core's integration registry.
+  Endpoint forms follow the selected provider and connection, and the Playground
+  shows estimated cost where available.
+- Journal writes suppress database query logging so request content is not logged.
+
+### Fixed
+
+- Provider errors expose safe classifications instead of response bodies or credentials.
+- Endpoint ordering uses the name as a deterministic tie-breaker; connection-change
+  form parameters preserve intent and invalidate stale discovery state.
+- Guard identity checks, native provider model filters, alert routing and stale
+  permission checks were corrected during the merged PR reviews.
+- The core dependency floor now requires V223. LiveView tests authenticate real
+  fixture sessions, exercising current session rights, and the Anthropic header
+  fixture no longer relies on overriding a built-in through a module contribution.
+
 ## 0.25.5 - 2026-10-13
 
 ### Fixed

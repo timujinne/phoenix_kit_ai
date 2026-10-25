@@ -14,7 +14,7 @@ defmodule PhoenixKitAI.AnthropicRulesTest do
 
   @moduletag :capture_log
 
-  alias PhoenixKit.ModuleRegistry
+  alias PhoenixKit.Integrations.Providers
   alias PhoenixKitAI.AIModel
   alias PhoenixKitAI.Completion
   alias PhoenixKitAI.OpenRouterClient
@@ -66,7 +66,7 @@ defmodule PhoenixKitAI.AnthropicRulesTest do
       end
 
       for id <-
-            ~w(claude-sonnet-4-6 claude-opus-4-5-20251101 claude-haiku-4-5-20251001 claude-3-5-sonnet-20241022) do
+            ~w(claude-sonnet-4-6 claude-opus-4-5-20251101 claude-haiku-4-5-20251001 claude-3-5-sonnet-20241022 claude-sonnet-4-5-latest claude-3-5-haiku-latest) do
         assert Completion.anthropic_sampling?(id), id
       end
     end
@@ -198,8 +198,16 @@ defmodule PhoenixKitAI.AnthropicRulesTest do
     end
 
     test "carries the headers the core registry declares for the provider" do
-      :ok = ModuleRegistry.register(RegistryProvider)
-      on_exit(fn -> ModuleRegistry.unregister(RegistryProvider) end)
+      # Built-in providers win over module contributions. Replace the cached
+      # definition in this synchronous test to exercise non-default headers.
+      providers = Enum.reject(Providers.all(), &(&1.key == "anthropic"))
+
+      :persistent_term.put(
+        {Providers, :all},
+        RegistryProvider.integration_providers() ++ providers
+      )
+
+      on_exit(&Providers.clear_cache/0)
       stub_models()
 
       assert {:ok, [_]} =

@@ -519,12 +519,8 @@ defmodule PhoenixKitAI.Web.EndpointForm do
 
       _ ->
         case stored_price(endpoint, model_id) do
-          %{^key => micro} ->
-            micro
-            |> Decimal.new()
-            |> Decimal.div(1_000_000)
-            |> Decimal.normalize()
-            |> Decimal.to_string(:normal)
+          %{^key => %Decimal{} = dollars} ->
+            dollars |> Decimal.normalize() |> Decimal.to_string(:normal)
 
           _ ->
             ""
@@ -1179,7 +1175,8 @@ defmodule PhoenixKitAI.Web.EndpointForm do
   end
 
   # The manual price fields as submitted, read with the module's money
-  # parser: `%{"input" => µ$, "output" => µ$}` (the changeset stamps the
+  # parser: `%{"input" => "0.60", "output" => "2.20"}`, dollars per 1M tokens
+  # as decimal strings (the changeset stamps the
   # model), `%{}` when both are empty (removes the price), `:half` when only
   # one is filled, `:error` when one is not a price, `:not_submitted`
   # when the form did not show them (the stored price is left as it is).
@@ -1198,14 +1195,14 @@ defmodule PhoenixKitAI.Web.EndpointForm do
   defp put_parsed_price(acc, key, value) when is_binary(value) do
     case String.trim(value) do
       "" -> {:cont, acc}
-      dollars -> put_micro(acc, key, Money.parse_dollars(dollars))
+      dollars -> put_price(acc, key, Money.parse_dollars(dollars))
     end
   end
 
   defp put_parsed_price(acc, _key, _missing), do: {:cont, acc}
 
-  defp put_micro(acc, key, {:ok, micro}), do: {:cont, Map.put(acc, key, micro)}
-  defp put_micro(_acc, _key, :error), do: {:halt, :error}
+  defp put_price(acc, key, {:ok, dollars}), do: {:cont, Map.put(acc, key, Money.to_json(dollars))}
+  defp put_price(_acc, _key, :error), do: {:halt, :error}
 
   defp both_halves(%{"input" => _, "output" => _} = pricing), do: pricing
   defp both_halves(pricing) when pricing == %{}, do: pricing
@@ -1429,7 +1426,37 @@ defmodule PhoenixKitAI.Web.EndpointForm do
     |> assign(:selected_uuids, selected_uuids)
     |> assign(:integration_connected, connected)
     |> refresh_provider_options(connections)
+    |> follow_offered_provider(connections)
   end
+
+  # A new endpoint starts on a provider the dropdown offers (`load_endpoint/3`),
+  # but the connections can change while the form is open: the first one of
+  # another provider is added, or the last one of the current provider is
+  # removed. The dropdown then offers only other providers and shows one of
+  # them while the form, the picker and the model fetch still mean the old
+  # one — and with a single provider offered the select cannot be changed to
+  # correct it. The form follows the dropdown as if the person had chosen it,
+  # keeping what they typed. An edited endpoint keeps its stored provider.
+  defp follow_offered_provider(%{assigns: %{endpoint: nil}} = socket, connections) do
+    current = socket.assigns.current_provider
+
+    case new_endpoint_provider(current, connections) do
+      ^current ->
+        socket
+
+      provider ->
+        typed = socket.assigns.form.params || %{}
+
+        {params, socket} =
+          maybe_handle_provider_change(Map.put(typed, "provider", provider), socket)
+
+        socket
+        |> assign(:form, to_form(AI.change_endpoint(%Endpoint{}, params)))
+        |> assign(:current_provider, provider)
+    end
+  end
+
+  defp follow_offered_provider(socket, _connections), do: socket
 
   # A validation or model fetch in flight for a connection that has just
   # gone away will be dropped by the uuid guards when it lands, so the

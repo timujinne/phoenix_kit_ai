@@ -22,9 +22,19 @@ defmodule PhoenixKitAI.Completion do
 
   require Logger
 
-  alias PhoenixKitAI.{Capabilities, Endpoint, Images, OpenRouterClient, Provider}
+  alias PhoenixKitAI.{
+    Capabilities,
+    Endpoint,
+    Images,
+    Limiter,
+    OpenRouterClient,
+    Provider,
+    ProviderError
+  }
 
   @timeout 120_000
+  @retry_statuses [408, 429, 500, 502, 503, 504]
+  @retry_defaults [max_attempts: 3, base_delay: 1_000, max_delay: 30_000, retry_timeouts: false]
 
   @doc """
   Makes a chat completion request to OpenRouter.
@@ -92,15 +102,27 @@ defmodule PhoenixKitAI.Completion do
   def chat_completion(endpoint, messages, opts \\ []) do
     url = build_url(endpoint, "/chat/completions")
     headers = OpenRouterClient.build_headers_from_endpoint(endpoint)
-    body = build_chat_body(endpoint, messages, opts)
+    # A per-call `model:` stands in for the endpoint's everywhere the body
+    # depends on the model (the Anthropic sampling and thinking rules too).
+    model = Keyword.get(opts, :model) || endpoint.model
+
+    body =
+      %{endpoint | model: model}
+      |> build_chat_body(messages, opts)
+      |> maybe_add_fallback_models(endpoint, model, Keyword.get(opts, :models))
+      |> maybe_include_usage(endpoint)
+
     start_time = System.monotonic_time(:millisecond)
 
-    case http_post(url, headers, body) do
+    case Limiter.run(endpoint, opts, fn -> http_post(url, headers, body, opts) end) do
       {:ok, %{status_code: 200, body: response_body}} ->
         response_body |> parse_success_response(start_time) |> with_sent_params(body)
 
       {:ok, %{status_code: status, body: response_body}} ->
         status |> handle_error_status(response_body) |> with_sent_params(body)
+
+      {:error, reason} when reason in [:concurrency_limit_timeout, :concurrency_queue_full] ->
+        {:error, reason}
 
       {:error, :timeout} ->
         {:error, :request_timeout}
@@ -138,15 +160,31 @@ defmodule PhoenixKitAI.Completion do
   @doc false
   # Public for testability. Maps an HTTP status + response body to a
   # `{:error, reason}` tuple where `reason` is an atom or tagged tuple.
-  def handle_error_status(401, _body), do: {:error, :invalid_api_key}
-  def handle_error_status(402, _body), do: {:error, :insufficient_credits}
-  def handle_error_status(429, _body), do: {:error, :rate_limited}
+  # The body decides where the providers document that the status alone
+  # misleads — money sent as a 429, say (`ProviderError`) — and what it
+  # said is noted for the request row.
+  def handle_error_status(status, response_body) do
+    error = ProviderError.parse(response_body)
+
+    result =
+      case ProviderError.class(status, error) do
+        nil -> status_error(status, response_body)
+        class -> {:error, class}
+      end
+
+    :ok = ProviderError.note(status, error, result)
+    result
+  end
+
+  defp status_error(401, _body), do: {:error, :invalid_api_key}
+  defp status_error(402, _body), do: {:error, :insufficient_credits}
+  defp status_error(429, _body), do: {:error, :rate_limited}
 
   # OpenRouter's answer to `provider.require_parameters` when no upstream
   # provider of the model takes every parameter sent. The model itself is
   # fine; the set of parameters is not. `chat_completion/3` fills in which
   # parameters were sent.
-  def handle_error_status(404, response_body) do
+  defp status_error(404, response_body) do
     message = extract_error_message(response_body) || ""
 
     if message =~ ~r/requested parameters/i do
@@ -160,7 +198,7 @@ defmodule PhoenixKitAI.Completion do
     end
   end
 
-  def handle_error_status(status, response_body), do: generic_error_status(status, response_body)
+  defp status_error(status, response_body), do: generic_error_status(status, response_body)
 
   defp generic_error_status(status, response_body) do
     # Log only the parsed error message (not the raw body) to avoid
@@ -231,19 +269,22 @@ defmodule PhoenixKitAI.Completion do
 
     body =
       %{
-        "model" => endpoint.model,
+        "model" => Keyword.get(opts, :model) || endpoint.model,
         "input" => input
       }
       |> maybe_add("dimensions", Keyword.get(opts, :dimensions))
 
     start_time = System.monotonic_time(:millisecond)
 
-    case http_post(url, headers, body) do
+    case Limiter.run(endpoint, opts, fn -> http_post(url, headers, body, opts) end) do
       {:ok, %{status_code: 200, body: response_body}} ->
         parse_success_response(response_body, start_time)
 
       {:ok, %{status_code: status, body: response_body}} ->
         handle_error_status(status, response_body)
+
+      {:error, reason} when reason in [:concurrency_limit_timeout, :concurrency_queue_full] ->
+        {:error, reason}
 
       {:error, :timeout} ->
         {:error, :request_timeout}
@@ -343,12 +384,15 @@ defmodule PhoenixKitAI.Completion do
 
     start_time = System.monotonic_time(:millisecond)
 
-    case http_post(url, headers, body) do
+    case Limiter.run(endpoint, opts, fn -> http_post(url, headers, body, opts) end) do
       {:ok, %{status_code: 200, body: response_body}} ->
         decode_audio(response_body, format, start_time)
 
       {:ok, %{status_code: status, body: response_body}} ->
         handle_error_status(status, response_body)
+
+      {:error, reason} when reason in [:concurrency_limit_timeout, :concurrency_queue_full] ->
+        {:error, reason}
 
       {:error, :timeout} ->
         {:error, :request_timeout}
@@ -384,12 +428,15 @@ defmodule PhoenixKitAI.Completion do
 
     start_time = System.monotonic_time(:millisecond)
 
-    case http_post(url, headers, body) do
+    case Limiter.run(endpoint, opts, fn -> http_post(url, headers, body, opts) end) do
       {:ok, %{status_code: 200, body: response_body}} ->
         decode_xai_audio(response_body, format, start_time)
 
       {:ok, %{status_code: status, body: response_body}} ->
         handle_error_status(status, response_body)
+
+      {:error, reason} when reason in [:concurrency_limit_timeout, :concurrency_queue_full] ->
+        {:error, reason}
 
       {:error, :timeout} ->
         {:error, :request_timeout}
@@ -750,25 +797,32 @@ defmodule PhoenixKitAI.Completion do
   Extracts usage information from a response.
 
   Returns a map with token counts and cost (if available from OpenRouter).
-  Cost is stored in nanodollars (1/1,000,000 of a dollar) to preserve precision
-  for cheap API calls. Stored in the cost_cents field for backward compatibility.
+  `cost` is what the provider reported, in US dollars, as a `Decimal` — a
+  JSON float read through its shortest decimal form, so `3.0e-5` is exactly
+  `0.00003` and a short embedding at $0.00000004 keeps its cost. Not rounded
+  here: `PhoenixKitAI.CallCost` rounds a call's cost once.
   """
   def extract_usage(%{"usage" => usage}) when is_map(usage) do
     %{
       prompt_tokens: usage["prompt_tokens"] || 0,
       completion_tokens: usage["completion_tokens"] || 0,
       total_tokens: usage["total_tokens"] || 0,
-      cost_cents: parse_cost(usage["cost"] || usage["total_cost"])
+      cost: parse_cost(usage["cost"] || usage["total_cost"])
     }
   end
 
   def extract_usage(_response) do
-    %{prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_cents: nil}
+    %{prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost: nil}
   end
 
-  # Store in nanodollars (1/1000000 of a dollar) for precision
-  # e.g., $0.00003 becomes 30 nanodollars
-  defp parse_cost(cost) when is_number(cost), do: round(cost * 1_000_000)
+  # A cost the provider sent: a number (or a decimal string), never negative.
+  defp parse_cost(cost) when is_number(cost) or is_binary(cost) do
+    case PhoenixKitAI.Money.to_decimal(cost) do
+      {:ok, decimal} -> if Decimal.negative?(decimal), do: nil, else: decimal
+      :error -> nil
+    end
+  end
+
   defp parse_cost(_), do: nil
 
   @doc false
@@ -880,7 +934,7 @@ defmodule PhoenixKitAI.Completion do
   defp anthropic_version(id) when is_binary(id) do
     id = id |> String.split("/") |> List.last()
 
-    case Regex.run(~r/^claude-[a-z]+-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/, id) ||
+    case Regex.run(~r/^claude-[a-z]+-(\d+)(?:-(\d{1,2}))?(?:-(?:\d{8}|latest))?$/, id) ||
            Regex.run(~r/^claude-(\d+)(?:-(\d{1,2}))?-[a-z]+/, id) do
       [_, major] -> {String.to_integer(major), 0}
       [_, major, minor] -> {String.to_integer(major), String.to_integer(minor)}
@@ -983,13 +1037,115 @@ defmodule PhoenixKitAI.Completion do
     end
   end
 
+  # OpenRouter model routing: `models: [...]` lets OpenRouter fall back to the next
+  # model when one is down, rate-limited or refuses (https://openrouter.ai/docs —
+  # "Model routing"). The call's model stays first. Other providers have no such
+  # parameter, so `models:` is not sent to them.
+  defp maybe_add_fallback_models(body, endpoint, model, [_ | _] = models) do
+    if Endpoint.openrouter?(endpoint),
+      do: Map.put(body, "models", Enum.uniq([model | models])),
+      else: body
+  end
+
+  defp maybe_add_fallback_models(body, _endpoint, _model, _), do: body
+
+  # OpenRouter reports the call's cost in `usage.cost` when asked
+  # (`usage: {include: true}`) — without it chat rows were logged with no cost.
+  defp maybe_include_usage(body, endpoint) do
+    if Endpoint.openrouter?(endpoint),
+      do: Map.put(body, "usage", %{"include" => true}),
+      else: body
+  end
+
   defp maybe_add(map, _key, nil), do: map
   defp maybe_add(map, _key, []), do: map
   defp maybe_add(map, key, value), do: Map.put(map, key, value)
 
-  defp http_post(url, headers, body) do
-    # Convert headers list to map format for Req
-    headers_map = Map.new(headers)
+  # One provider POST, plus retries when the call (or the app env `:retry`) asks for
+  # them. `opts`: `timeout:` (ms, default the app env `:timeout` or 120 s) and
+  # `retry:` — `true` for the defaults, a keyword list to tune them, `false` / unset
+  # for none (the default, so a caller with its own retry logic is unaffected):
+  #
+  #   * `max_attempts` (3, the first try included), `base_delay` (1000 ms, doubled
+  #     each attempt, ±20 % jitter), `max_delay` (30 s);
+  #   * retried: HTTP 408, 429, 500, 502, 503, 504 and transport errors other than a
+  #     timeout — never a 429 that is about money (`ProviderError`);
+  #     `retry_timeouts: true` retries a timeout too (the provider may have
+  #     done — and billed — the work a timed-out call never saw);
+  #   * a `Retry-After` header (seconds) is honoured up to `max_delay`.
+  #
+  # Each retry emits `[:phoenix_kit_ai, :request, :retry]` and an info log line with
+  # the status and attempt only — never the URL's query, a header or the body.
+  defp http_post(url, headers, body, opts) do
+    post_with_retry(url, Map.new(headers), body, opts, retry_policy(opts), 1)
+  end
+
+  defp retry_policy(opts) do
+    case Keyword.get(opts, :retry, Application.get_env(:phoenix_kit_ai, :retry, false)) do
+      true -> @retry_defaults
+      policy when is_list(policy) -> Keyword.merge(@retry_defaults, policy)
+      _ -> nil
+    end
+  end
+
+  defp post_with_retry(url, headers, body, opts, policy, attempt) do
+    result = post_once(url, headers, body, opts)
+
+    if policy && attempt < policy[:max_attempts] && retryable?(result, policy) do
+      delay = retry_delay(policy, attempt, retry_after(result))
+
+      :telemetry.execute(
+        [:phoenix_kit_ai, :request, :retry],
+        %{attempt: attempt, delay_ms: delay},
+        %{
+          status: retry_status(result)
+        }
+      )
+
+      Logger.info(
+        "[PhoenixKitAI] retrying a provider call after #{retry_status(result)} " <>
+          "(attempt #{attempt + 1} of #{policy[:max_attempts]}) in #{delay} ms"
+      )
+
+      Process.sleep(delay)
+      post_with_retry(url, headers, body, opts, policy, attempt + 1)
+    else
+      strip_retry_after(result)
+    end
+  end
+
+  # Money sent as a 429 (`ProviderError.class/2`: an exhausted quota or
+  # balance) is never worth a retry: the answer would not change.
+  defp retryable?({:ok, %{status_code: status, body: body}}, _policy) do
+    status in @retry_statuses and
+      ProviderError.class(status, ProviderError.parse(body)) != :insufficient_credits
+  end
+
+  defp retryable?({:error, :timeout}, policy), do: policy[:retry_timeouts] == true
+  defp retryable?({:error, _transport}, _policy), do: true
+
+  defp retry_status({:ok, %{status_code: status}}), do: "HTTP #{status}"
+  defp retry_status({:error, :timeout}), do: "a timeout"
+  defp retry_status({:error, _}), do: "a connection error"
+
+  defp retry_after({:ok, %{retry_after: seconds}}) when is_integer(seconds), do: seconds
+  defp retry_after(_), do: nil
+
+  defp strip_retry_after({:ok, response}), do: {:ok, Map.delete(response, :retry_after)}
+  defp strip_retry_after(other), do: other
+
+  @doc false
+  # Public for testing: the pause before retry number `attempt` (1-based).
+  def retry_delay(policy, attempt, retry_after_s) do
+    exp = policy[:base_delay] * Integer.pow(2, attempt - 1)
+    jittered = round(exp * (0.8 + :rand.uniform() * 0.4))
+    wait = if retry_after_s, do: max(jittered, retry_after_s * 1000), else: jittered
+    min(wait, policy[:max_delay])
+  end
+
+  defp post_once(url, headers_map, body, opts) do
+    timeout =
+      Keyword.get(opts, :timeout) || Application.get_env(:phoenix_kit_ai, :timeout, @timeout)
 
     # Redirects are not followed: the endpoint's base URL passed the SSRF
     # guard when it was saved, and a 30x would let that public host send
@@ -999,16 +1155,20 @@ defmodule PhoenixKitAI.Completion do
       json: body,
       headers: headers_map,
       redirect: false,
-      receive_timeout: @timeout,
-      connect_options: [timeout: @timeout]
+      receive_timeout: timeout,
+      connect_options: [timeout: timeout]
     ]
 
     # `:req_options` is empty in production. Tests opt in via
     # `Application.put_env(:phoenix_kit_ai, :req_options, plug: {Req.Test, Stub})`.
-    opts = base_opts ++ Application.get_env(:phoenix_kit_ai, :req_options, [])
+    req_opts = base_opts ++ Application.get_env(:phoenix_kit_ai, :req_options, [])
 
-    case Req.post(url, opts) do
-      {:ok, %Req.Response{status: status, body: response_body}} ->
+    :ok = ProviderError.clear()
+
+    case Req.post(url, req_opts) do
+      {:ok, %Req.Response{status: status, body: response_body} = response} ->
+        if status not in 200..299, do: ProviderError.put_retry_after(response)
+
         # Req automatically decodes JSON, so encode it back to string for consistency
         body_string =
           if is_map(response_body) or is_list(response_body) do
@@ -1017,7 +1177,7 @@ defmodule PhoenixKitAI.Completion do
             to_string(response_body)
           end
 
-        {:ok, %{status_code: status, body: body_string}}
+        {:ok, %{status_code: status, body: body_string, retry_after: retry_after_s(response)}}
 
       {:error, %Req.TransportError{reason: :timeout}} ->
         {:error, :timeout}
@@ -1030,6 +1190,18 @@ defmodule PhoenixKitAI.Completion do
         Logger.error("HTTP POST failed with unexpected error: #{inspect(reason)}")
         {:error, reason}
     end
+  end
+
+  # `Retry-After` in whole seconds, rounded up (`Req.Response.get_retry_after/1`
+  # reads both the seconds and the HTTP-date form), or nil — also for a value
+  # it cannot read, which it raises on.
+  defp retry_after_s(%Req.Response{} = response) do
+    case Req.Response.get_retry_after(response) do
+      ms when is_integer(ms) and ms >= 0 -> div(ms + 999, 1000)
+      _ -> nil
+    end
+  rescue
+    _ -> nil
   end
 
   @doc false
