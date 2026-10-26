@@ -61,7 +61,7 @@ defmodule PhoenixKitAI.Budget do
   concurrent callers can overshoot by their in-flight calls. It also fails
   open — a database error reads as zero spend and no cap — because the
   module would otherwise refuse everything on a blip (a warning names the
-  exception, once per node and kind).
+  exception, once per node and outage).
 
   The per-user cap only bites when the caller passes `user_uuid:`, and the
   value must be a PhoenixKit user uuid (the usage row has a foreign key on
@@ -95,6 +95,7 @@ defmodule PhoenixKitAI.Budget do
   }
   @warn_setting "ai_budget_warn_percent"
   @zone_setting "time_zone"
+  @read_failed_key {__MODULE__, :read_failed, :all}
   # How long the month's spend sum is reused: the sum scans a whole month of
   # rows, which a busy site cannot afford on every call.
   @month_cache_ttl_ms 30_000
@@ -148,8 +149,9 @@ defmodule PhoenixKitAI.Budget do
 
   @doc """
   Spent / limit / remaining for every scope that has a cap (the user scope
-  only when `user_uuid:` is given), with no side effects — hosts show it,
-  `check/2` acts on it. Takes an endpoint struct or uuid. Money is dollars
+  only when `user_uuid:` is given), with no warnings or refusals — hosts show
+  it, `check/2` acts on it. It fills the monthly sum's cache, and reads
+  through it: the monthly `:global_month` spend can be up to 30 seconds old. Takes an endpoint struct or uuid. Money is dollars
   (`Decimal`), `:user_calls` a count. A scope still in the released versions'
   settings only is left out (`check/2` refuses on it).
   """
@@ -317,7 +319,7 @@ defmodule PhoenixKitAI.Budget do
     since = window_start(scope)
 
     try do
-      read_spent(scope, since, endpoint, user_uuid)
+      read_spent(scope, since, endpoint, user_uuid) |> tap(fn _ -> read_ok() end)
     rescue
       error -> read_failed(scope, inspect(error.__struct__))
     catch
@@ -338,9 +340,11 @@ defmodule PhoenixKitAI.Budget do
     if scope == :user_calls, do: 0, else: Decimal.new(0)
   end
 
-  # Once per node and kind of failure, not on every call while the database is down.
+  # Once per outage on this node, not on every call while the database is
+  # down: the flag clears on the next successful read, so a later outage is
+  # logged again.
   defp log_read_failed(class) do
-    key = {__MODULE__, :read_failed, class}
+    key = @read_failed_key
     table = PhoenixKitAI.RequestCache.flags_table()
 
     unless :ets.member(table, key) do
@@ -355,6 +359,12 @@ defmodule PhoenixKitAI.Budget do
     _ -> :ok
   end
 
+  defp read_ok do
+    :ets.delete(PhoenixKitAI.RequestCache.flags_table(), @read_failed_key)
+  rescue
+    ArgumentError -> true
+  end
+
   # The month's sum, reused for a short while. The key holds the month start,
   # so a new month (or another time zone) never sees the old sum. A failed
   # read raises past this and is not stored. TTL 0 turns it off.
@@ -364,13 +374,17 @@ defmodule PhoenixKitAI.Budget do
     key = {__MODULE__, :month_spent, since}
     now = System.monotonic_time(:millisecond)
 
-    case ttl > 0 && cache_read(table, key, now) do
+    # Anything but a positive integer means no cache: a bad TTL must not
+    # raise and read as "nothing spent".
+    cache? = is_integer(ttl) and ttl > 0
+
+    case cache? && cache_read(table, key, now) do
       {:ok, sum} ->
         sum
 
       _ ->
         sum = fun.()
-        if ttl > 0, do: cache_write(table, key, {sum, now + ttl})
+        if cache?, do: cache_write(table, key, {sum, now + ttl})
         sum
     end
   end

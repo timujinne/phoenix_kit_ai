@@ -62,7 +62,8 @@ Semantics, in order of how often they surprise:
   it to `0`). A failed read is never cached. This is one more reason a cap is
   a brake and not an invoice ceiling: spend can pass the monthly cap by up to
   30 seconds of calls on top of the in-flight ones. `status/2` reads through
-  the same cache.
+  (and fills) the same cache, so its monthly spend can be 30 seconds old. A
+  TTL that is not a positive integer means no cache.
 - **Reached means stopped.** `remaining <= 0` refuses; a cap of exactly
   the amount spent is not room for one more call.
 - **Cached answers are refused too.** A cap is a stop switch: once spent,
@@ -77,7 +78,9 @@ Semantics, in order of how often they surprise:
   `limit_reached` guard event (scope `budget:<scope>`), and the guard's
   watchers are told once per local day (`PhoenixKitAI.GuardEvents`); for the
   monthly cap once per local month, since it only lifts when the month turns
-  (or the cap is raised).
+  (or the cap is raised). That holds even when the cap is raised and reached
+  again in the same month: the later refusals are refusals as ever, but not a
+  new event or notice.
 - **Task limits come first.** A call that names a declared task is checked
   against the task's calendar-day and month limits (`PhoenixKitAI.TaskLimits`)
   before the caps; the caps stay the site-wide safety net (the rolling 24 hours, and the calendar

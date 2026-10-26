@@ -316,6 +316,37 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
       assert dollars?(spent, "3")
     end
 
+    test "an expired entry is read afresh", %{endpoint: ep} do
+      {:ok, _} = Budget.set_limit(:global_month, "100")
+      usage_row(ep, DateTime.utc_now(), "1.00")
+
+      expired = {Decimal.new(99), System.monotonic_time(:millisecond) - 1}
+      :ets.insert(RequestCache.flags_table(), {{Budget, :month_spent, month_start()}, expired})
+
+      assert %{spent: spent} = month_status(ep)
+      assert dollars?(spent, "1")
+    end
+
+    test "a TTL that is not a positive integer means no cache, not no cap", %{endpoint: ep} do
+      stub_chat(self())
+      {:ok, _} = Budget.set_limit(:global_month, "1.00")
+      usage_row(ep, DateTime.utc_now(), "0.40")
+
+      for ttl <- [nil, "30000", 0, -5, 1.5] do
+        Application.put_env(:phoenix_kit_ai, :budget_month_cache_ttl, ttl)
+        Budget.reset_warnings()
+        row = usage_row(ep, DateTime.utc_now(), "0.30")
+
+        assert %{spent: spent} = month_status(ep)
+        assert dollars?(spent, "0.7"), "ttl #{inspect(ttl)}: #{inspect(spent)}"
+        TestRepo.delete!(row)
+      end
+
+      Application.put_env(:phoenix_kit_ai, :budget_month_cache_ttl, nil)
+      usage_row(ep, DateTime.utc_now(), "0.60")
+      assert {:error, {:budget_exceeded, :global_month}} = PhoenixKitAI.ask(ep.uuid, "q")
+    end
+
     test "a failed read is not cached", %{endpoint: ep} do
       {:ok, _} = Budget.set_limit(:global_month, "100")
       table = Request.__schema__(:source)
@@ -332,6 +363,15 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
   end
 
   describe "a failing read" do
+    test "a successful read clears the flag, so a later outage is logged again", %{endpoint: ep} do
+      {:ok, _} = Budget.set_limit(:global_month, "1.00")
+      flags = RequestCache.flags_table()
+      :ets.insert(flags, {{Budget, :read_failed, :all}, true})
+
+      assert %{spent: _} = month_status(ep)
+      assert :ets.lookup(flags, {Budget, :read_failed, :all}) == []
+    end
+
     test "fails open and is logged once per node", %{endpoint: ep} do
       {:ok, _} = Budget.set_limit(:global_month, "1.00")
       {:ok, _} = Budget.set_limit(:global, "1.00")
