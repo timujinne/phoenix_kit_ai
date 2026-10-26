@@ -19,7 +19,10 @@ defmodule PhoenixKitAI.Budget do
   window: from the local midnight that starts the current month to now, in
   the site time zone (Settings → `time_zone`; the month window of
   `PhoenixKitAI.TaskLimits.windows/1`). It is calendar, not rolling: it
-  starts again at zero on the first of the month. Both site-wide caps can
+  starts again at zero on the first of the month. Because it scans a month of
+  rows, its sum is reused for 30 seconds (`config :phoenix_kit_ai,
+  budget_month_cache_ttl: milliseconds`, `0` = off): spend can pass the cap by
+  that much more. Both site-wide caps can
   be set together ("$8 a day, $100 a month"); whichever is reached first
   refuses.
 
@@ -57,7 +60,8 @@ defmodule PhoenixKitAI.Budget do
   counts at 09:00. The check reads the usage table; there is no reservation, so
   concurrent callers can overshoot by their in-flight calls. It also fails
   open — a database error reads as zero spend and no cap — because the
-  module would otherwise refuse everything on a blip.
+  module would otherwise refuse everything on a blip (a warning names the
+  exception, once per node and kind).
 
   The per-user cap only bites when the caller passes `user_uuid:`, and the
   value must be a PhoenixKit user uuid (the usage row has a foreign key on
@@ -90,6 +94,10 @@ defmodule PhoenixKitAI.Budget do
     user: "ai_daily_budget_per_user"
   }
   @warn_setting "ai_budget_warn_percent"
+  @zone_setting "time_zone"
+  # How long the month's spend sum is reused: the sum scans a whole month of
+  # rows, which a busy site cannot afford on every call.
+  @month_cache_ttl_ms 30_000
   @default_warn_percent 80
   @window_seconds 24 * 60 * 60
 
@@ -226,7 +234,9 @@ defmodule PhoenixKitAI.Budget do
   # One cached batch read for the settings; the settings cache is
   # invalidated on every write, so `set_limit/2` takes effect at once.
   defp settings do
-    keys = Map.values(@settings) ++ Map.values(@legacy_settings) ++ [@warn_setting]
+    keys =
+      Map.values(@settings) ++ Map.values(@legacy_settings) ++ [@warn_setting, @zone_setting]
+
     PhoenixKit.Settings.get_settings_cached(keys, %{})
   rescue
     _ -> %{}
@@ -300,23 +310,92 @@ defmodule PhoenixKitAI.Budget do
   end
 
   # Dollars spent in the scope's window (a nil cost counts as zero), or for
-  # :user_calls the number of calls.
+  # :user_calls the number of calls. Only the read is shielded: the window is
+  # computed outside, and a failing read is logged (once per node) and reads
+  # as nothing spent.
   defp spent(scope, endpoint, user_uuid) do
     since = window_start(scope)
 
-    if scope == :user_calls,
-      do: calls(since, user_uuid),
-      else: money(scope, since, endpoint, user_uuid)
+    try do
+      read_spent(scope, since, endpoint, user_uuid)
+    rescue
+      error -> read_failed(scope, inspect(error.__struct__))
+    catch
+      :exit, _ -> read_failed(scope, "exit")
+    end
+  end
+
+  defp read_spent(:user_calls, since, _endpoint, user_uuid), do: calls(since, user_uuid)
+
+  defp read_spent(:global_month, since, endpoint, user_uuid) do
+    month_cached(since, fn -> money(:global_month, since, endpoint, user_uuid) end)
+  end
+
+  defp read_spent(scope, since, endpoint, user_uuid), do: money(scope, since, endpoint, user_uuid)
+
+  defp read_failed(scope, class) do
+    log_read_failed(class)
+    if scope == :user_calls, do: 0, else: Decimal.new(0)
+  end
+
+  # Once per node and kind of failure, not on every call while the database is down.
+  defp log_read_failed(class) do
+    key = {__MODULE__, :read_failed, class}
+    table = PhoenixKitAI.RequestCache.flags_table()
+
+    unless :ets.member(table, key) do
+      :ets.insert(table, {key, true})
+
+      Logger.warning(
+        "[PhoenixKitAI] a spend cap could not read the usage table (#{class}): the cap is " <>
+          "not enforced while reads fail (further failures are not logged on this node)"
+      )
+    end
   rescue
-    _ -> if scope == :user_calls, do: 0, else: Decimal.new(0)
-  catch
-    :exit, _ -> if scope == :user_calls, do: 0, else: Decimal.new(0)
+    _ -> :ok
+  end
+
+  # The month's sum, reused for a short while. The key holds the month start,
+  # so a new month (or another time zone) never sees the old sum. A failed
+  # read raises past this and is not stored. TTL 0 turns it off.
+  defp month_cached(since, fun) do
+    ttl = Application.get_env(:phoenix_kit_ai, :budget_month_cache_ttl, @month_cache_ttl_ms)
+    table = PhoenixKitAI.RequestCache.flags_table()
+    key = {__MODULE__, :month_spent, since}
+    now = System.monotonic_time(:millisecond)
+
+    case ttl > 0 && cache_read(table, key, now) do
+      {:ok, sum} ->
+        sum
+
+      _ ->
+        sum = fun.()
+        if ttl > 0, do: cache_write(table, key, {sum, now + ttl})
+        sum
+    end
+  end
+
+  defp cache_read(table, key, now) do
+    case :ets.lookup(table, key) do
+      [{^key, {sum, expires_at}}] when expires_at > now -> {:ok, sum}
+      _ -> :miss
+    end
+  rescue
+    ArgumentError -> :miss
+  end
+
+  defp cache_write(table, key, value) do
+    :ets.insert(table, {key, value})
+  rescue
+    ArgumentError -> true
   end
 
   # The monthly cap counts from the start of the site's calendar month, the
   # window `TaskLimits` uses; the others look at the trailing 24 hours.
-  defp window_start(:global_month),
-    do: PhoenixKitAI.TaskLimits.windows().month |> elem(0)
+  defp window_start(:global_month) do
+    zone = settings()[@zone_setting] || "0"
+    PhoenixKitAI.TaskLimits.windows(DateTime.utc_now(), zone).month |> elem(0)
+  end
 
   defp window_start(_scope), do: DateTime.add(DateTime.utc_now(), -@window_seconds, :second)
 
@@ -344,7 +423,8 @@ defmodule PhoenixKitAI.Budget do
 
     query =
       case scope do
-        scope when scope in [:global, :global_month] -> query
+        :global -> query
+        :global_month -> query
         :endpoint -> where(query, [r], r.endpoint_uuid == ^endpoint.uuid)
         :user -> where(query, [r], r.user_uuid == ^user_uuid)
       end

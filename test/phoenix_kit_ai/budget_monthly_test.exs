@@ -3,6 +3,8 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
 
   use PhoenixKitAI.DataCase, async: false
 
+  alias PhoenixKit.Notifications.Notification
+  alias PhoenixKit.Test.Fixtures
   alias PhoenixKitAI.{Budget, Errors, GuardEvent, Request, RequestCache, TaskLimits}
   alias PhoenixKitAI.Test.Repo, as: TestRepo
 
@@ -99,12 +101,16 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
   defp dollars?(_value, _expected), do: false
 
   defp attach(event) do
+    id = "#{inspect(event)}-#{System.unique_integer([:positive])}"
+
     :telemetry.attach(
-      "#{inspect(event)}-#{System.unique_integer([:positive])}",
+      id,
       event,
       fn e, m, meta, pid -> send(pid, {:event, e, m, meta}) end,
       self()
     )
+
+    on_exit(fn -> :telemetry.detach(id) end)
   end
 
   describe "the setting" do
@@ -186,15 +192,16 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
     end
 
     test "a month is longer than the rolling day the other caps look at", %{endpoint: ep} do
-      # Rows from days ago in this month count for the monthly cap only; the
-      # window starts at the local month start, so skip when it is today.
+      # A row from a few days ago, inside this month, counts for the monthly
+      # cap only. On the first days of a month there is no such row: then a
+      # row at the month's first instant must count instead.
       from = month_start()
-      old = DateTime.add(DateTime.utc_now(), -3 * 86_400, :second)
+      now = DateTime.utc_now()
+      {:ok, _} = Budget.set_limit(:global, "1.00")
+      {:ok, _} = Budget.set_limit(:global_month, "1.00")
 
-      if DateTime.compare(old, from) == :gt do
-        {:ok, _} = Budget.set_limit(:global, "1.00")
-        {:ok, _} = Budget.set_limit(:global_month, "1.00")
-        usage_row(ep, old, "2.00")
+      if DateTime.diff(now, from) > 25 * 3600 do
+        usage_row(ep, DateTime.add(from, 60, :second), "2.00")
 
         assert [%{scope: :global, spent: day}, %{scope: :global_month, spent: month}] =
                  Budget.status(ep, [])
@@ -204,6 +211,10 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
 
         assert {:error, {:budget_exceeded, :global_month}} = PhoenixKitAI.ask(ep.uuid, "q")
         refute_received :provider_called
+      else
+        usage_row(ep, from, "2.00")
+        assert %{spent: month} = month_status(ep)
+        assert dollars?(month, "2")
       end
     end
 
@@ -228,14 +239,29 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
       assert [%{scope: :global}, %{scope: :global_month}] = Budget.status(ep, [])
     end
 
-    test "the refusal is a guard event of scope budget:global_month", %{endpoint: ep} do
+    test "the refusal is a guard event, once per month, and tells the owner", %{endpoint: ep} do
+      owner = Fixtures.user_fixture()
+      PhoenixKit.Notifications.enable_system()
       stub_chat(self())
       {:ok, _} = Budget.set_limit(:global_month, "0.50")
       assert {:ok, _} = PhoenixKitAI.ask(ep.uuid, "q1")
-      assert {:error, {:budget_exceeded, :global_month}} = PhoenixKitAI.ask(ep.uuid, "q2")
 
-      assert [%GuardEvent{ref: %{"scope" => "budget:global_month"}}] =
+      for _ <- 1..2 do
+        assert {:error, {:budget_exceeded, :global_month}} = PhoenixKitAI.ask(ep.uuid, "q2")
+      end
+
+      month = TaskLimits.period_keys(DateTime.utc_now()).month
+
+      # Once per month, not per day: the refusal lasts until the month turns.
+      assert [%GuardEvent{ref: %{"scope" => "budget:global_month"}, dedupe_key: key}] =
                TestRepo.all(from(e in GuardEvent, where: e.kind == "limit_reached"))
+
+      assert key == "limit_reached:budget:global_month:-:#{month}"
+
+      assert [%Notification{metadata: %{"notification_text" => text}}] =
+               TestRepo.all(from(n in Notification, where: n.recipient_uuid == ^owner.uuid))
+
+      assert text =~ "month"
     end
 
     test "the warning fires once per crossing, with the scope in its metadata", %{endpoint: ep} do
@@ -252,6 +278,73 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
       refute_received {:event, _, _, _}
       assert {:error, {:budget_exceeded, :global_month}} = PhoenixKitAI.ask(ep.uuid, "4")
       refute_received {:event, _, _, _}
+    end
+  end
+
+  describe "the monthly sum is cached for a short while" do
+    setup do
+      Application.put_env(:phoenix_kit_ai, :budget_month_cache_ttl, 30_000)
+      on_exit(fn -> Application.put_env(:phoenix_kit_ai, :budget_month_cache_ttl, 0) end)
+    end
+
+    test "within the TTL the sum is served from the cache", %{endpoint: ep} do
+      {:ok, _} = Budget.set_limit(:global_month, "100")
+      usage_row(ep, DateTime.utc_now(), "1.00")
+      assert %{spent: spent} = month_status(ep)
+      assert dollars?(spent, "1")
+
+      usage_row(ep, DateTime.utc_now(), "2.00")
+      assert %{spent: spent} = month_status(ep)
+      assert dollars?(spent, "1"), "the second read should have come from the cache"
+
+      # Dropping the flags (tests) drops the cached sum too.
+      Budget.reset_warnings()
+      assert %{spent: spent} = month_status(ep)
+      assert dollars?(spent, "3")
+    end
+
+    test "another month start does not reuse the cached sum", %{endpoint: ep} do
+      {:ok, _} = Budget.set_limit(:global_month, "100")
+      usage_row(ep, DateTime.utc_now(), "1.00")
+      assert %{spent: spent} = month_status(ep)
+      assert dollars?(spent, "1")
+
+      usage_row(ep, DateTime.utc_now(), "2.00")
+      # A zone whose month starts at another instant is another cache key.
+      {:ok, _} = PhoenixKit.Settings.update_setting("time_zone", "Pacific/Honolulu")
+      assert %{spent: spent} = month_status(ep)
+      assert dollars?(spent, "3")
+    end
+
+    test "a failed read is not cached", %{endpoint: ep} do
+      {:ok, _} = Budget.set_limit(:global_month, "100")
+      table = Request.__schema__(:source)
+      TestRepo.query!(~s(ALTER TABLE "#{table}" RENAME TO "#{table}_away"))
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert %{spent: spent} = month_status(ep)
+        assert dollars?(spent, "0")
+      end)
+
+      flags = RequestCache.flags_table()
+      assert :ets.match(flags, {{Budget, :month_spent, :_}, :_}) == []
+    end
+  end
+
+  describe "a failing read" do
+    test "fails open and is logged once per node", %{endpoint: ep} do
+      {:ok, _} = Budget.set_limit(:global_month, "1.00")
+      {:ok, _} = Budget.set_limit(:global, "1.00")
+      table = Request.__schema__(:source)
+      TestRepo.query!(~s(ALTER TABLE "#{table}" RENAME TO "#{table}_away"))
+
+      log = ExUnit.CaptureLog.capture_log(fn -> assert [_, _] = Budget.status(ep, []) end)
+      assert log =~ "spend cap"
+      assert log =~ "Postgrex.Error"
+      assert log =~ "not enforced"
+
+      again = ExUnit.CaptureLog.capture_log(fn -> Budget.status(ep, []) end)
+      refute again =~ "spend cap"
     end
   end
 
