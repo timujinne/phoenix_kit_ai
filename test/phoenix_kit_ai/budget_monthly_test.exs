@@ -372,6 +372,25 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
       assert :ets.lookup(flags, {Budget, :read_failed, :all}) == []
     end
 
+    test "a successful call-count read clears the flag", %{endpoint: ep} do
+      {:ok, _} = Budget.set_limit(:user_calls, 5)
+      flags = RequestCache.flags_table()
+      :ets.insert(flags, {{Budget, :read_failed, :all}, true})
+
+      user = Fixtures.user_fixture()
+      assert [%{scope: :user_calls}] = Budget.status(ep, user_uuid: user.uuid)
+      assert :ets.lookup(flags, {Budget, :read_failed, :all}) == []
+    end
+
+    test "a successful money read clears the flag", %{endpoint: ep} do
+      {:ok, _} = Budget.set_limit(:global, "1.00")
+      flags = RequestCache.flags_table()
+      :ets.insert(flags, {{Budget, :read_failed, :all}, true})
+
+      assert [%{scope: :global}] = Budget.status(ep, [])
+      assert :ets.lookup(flags, {Budget, :read_failed, :all}) == []
+    end
+
     test "a month sum served from the cache leaves the flag set", %{endpoint: ep} do
       Application.put_env(:phoenix_kit_ai, :budget_month_cache_ttl, 30_000)
       on_exit(fn -> Application.put_env(:phoenix_kit_ai, :budget_month_cache_ttl, 0) end)
@@ -400,7 +419,18 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
       stale = {Budget, :month_spent, ~U[2001-01-01 00:00:00Z]}
       :ets.insert(flags, {stale, {Decimal.new(0), System.monotonic_time(:millisecond) + 60_000}})
 
+      # The read-failure flag is not here: the real read that fills the cache
+      # clears it, by design.
+      others = [
+        {Budget, :global_month, :all},
+        {Budget, :unmigrated, :global}
+      ]
+
+      for key <- others, do: :ets.insert(flags, {key, true})
+
       assert %{spent: _} = month_status(ep)
+
+      for key <- others, do: assert(:ets.lookup(flags, key) == [{key, true}])
 
       assert [{{Budget, :month_spent, since}, _}] =
                :ets.match_object(flags, {{Budget, :month_spent, :_}, :_})
@@ -408,7 +438,7 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
       refute since == ~U[2001-01-01 00:00:00Z]
     end
 
-    test "fails open and is logged once per node", %{endpoint: ep} do
+    test "fails open and is logged once per outage per node", %{endpoint: ep} do
       {:ok, _} = Budget.set_limit(:global_month, "1.00")
       {:ok, _} = Budget.set_limit(:global, "1.00")
       table = Request.__schema__(:source)
