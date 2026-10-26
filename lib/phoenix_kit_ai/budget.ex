@@ -61,7 +61,7 @@ defmodule PhoenixKitAI.Budget do
   concurrent callers can overshoot by their in-flight calls. It also fails
   open — a database error reads as zero spend and no cap — because the
   module would otherwise refuse everything on a blip (a warning names the
-  exception, once per node and outage).
+  exception, once per outage per node).
 
   The per-user cap only bites when the caller passes `user_uuid:`, and the
   value must be a PhoenixKit user uuid (the usage row has a foreign key on
@@ -313,13 +313,13 @@ defmodule PhoenixKitAI.Budget do
 
   # Dollars spent in the scope's window (a nil cost counts as zero), or for
   # :user_calls the number of calls. Only the read is shielded: the window is
-  # computed outside, and a failing read is logged (once per node) and reads
-  # as nothing spent.
+  # computed outside, and a failing read is logged (once per outage per node)
+  # and reads as nothing spent.
   defp spent(scope, endpoint, user_uuid) do
     since = window_start(scope)
 
     try do
-      read_spent(scope, since, endpoint, user_uuid) |> tap(fn _ -> read_ok() end)
+      read_spent(scope, since, endpoint, user_uuid)
     rescue
       error -> read_failed(scope, inspect(error.__struct__))
     catch
@@ -327,13 +327,20 @@ defmodule PhoenixKitAI.Budget do
     end
   end
 
-  defp read_spent(:user_calls, since, _endpoint, user_uuid), do: calls(since, user_uuid)
+  # Each branch clears the read-failure flag only after a database read that
+  # succeeded: a sum served from the month cache proves nothing about the
+  # database.
+  defp read_spent(:user_calls, since, _endpoint, user_uuid),
+    do: since |> calls(user_uuid) |> read_ok()
 
   defp read_spent(:global_month, since, endpoint, user_uuid) do
-    month_cached(since, fn -> money(:global_month, since, endpoint, user_uuid) end)
+    month_cached(since, fn ->
+      :global_month |> money(since, endpoint, user_uuid) |> read_ok()
+    end)
   end
 
-  defp read_spent(scope, since, endpoint, user_uuid), do: money(scope, since, endpoint, user_uuid)
+  defp read_spent(scope, since, endpoint, user_uuid),
+    do: scope |> money(since, endpoint, user_uuid) |> read_ok()
 
   defp read_failed(scope, class) do
     log_read_failed(class)
@@ -359,10 +366,11 @@ defmodule PhoenixKitAI.Budget do
     _ -> :ok
   end
 
-  defp read_ok do
+  defp read_ok(value) do
     :ets.delete(PhoenixKitAI.RequestCache.flags_table(), @read_failed_key)
+    value
   rescue
-    ArgumentError -> true
+    ArgumentError -> value
   end
 
   # The month's sum, reused for a short while. The key holds the month start,
@@ -384,7 +392,7 @@ defmodule PhoenixKitAI.Budget do
 
       _ ->
         sum = fun.()
-        if cache?, do: cache_write(table, key, {sum, now + ttl})
+        if cache?, do: cache_write(table, key, {sum, now + ttl}, since)
         sum
     end
   end
@@ -398,7 +406,12 @@ defmodule PhoenixKitAI.Budget do
     ArgumentError -> :miss
   end
 
-  defp cache_write(table, key, value) do
+  # Entries for other month starts are dead weight: drop them.
+  defp cache_write(table, key, value, since) do
+    :ets.select_delete(table, [
+      {{{__MODULE__, :month_spent, :"$1"}, :_}, [{:"=/=", :"$1", {:const, since}}], [true]}
+    ])
+
     :ets.insert(table, {key, value})
   rescue
     ArgumentError -> true

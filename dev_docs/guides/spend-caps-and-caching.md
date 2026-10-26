@@ -90,8 +90,9 @@ Semantics, in order of how often they surprise:
 - **Fails open.** A database error reads as zero spend and no cap, so a
   blip does not refuse every call. The panel split on this; availability
   won, and the module logs a warning naming the exception class, once per
-  node and class, so the first failure is visible without a flood while the
-  database is down.
+  outage per node (a flag cleared by the next successful database read, not by
+  a sum served from the month cache), so the first failure is visible without
+  a flood while the database is down.
 - **Warnings fire from `check/2` only.** `status/2` is pure so a dashboard
   polling it does not consume the once-per-crossing warning. The flags
   live in a small ETS table (never `persistent_term`, whose writes are a
