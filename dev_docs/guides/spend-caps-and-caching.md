@@ -38,7 +38,9 @@ settings module; there is no admin form yet.
 What a check costs: one cached batch read of the cap settings (the
 settings cache is invalidated on every write, so a new cap applies at
 once) and, per scope that has a cap, one aggregate over the last 24 hours
-of success rows. With no caps set the requests table is not touched.
+of success rows (since the start of the month for the monthly cap, whose sum
+is reused for 30 seconds, see below). With no caps set the requests table is
+not touched.
 
 Semantics, in order of how often they surprise:
 
@@ -51,6 +53,16 @@ Semantics, in order of how often they surprise:
   It refuses with `{:error, {:budget_exceeded, :global_month}}`; the daily and
   monthly site caps can both be set and either refuses when reached. A
   setting only: no migration.
+- **The monthly sum is cached for 30 seconds.** Unlike the daily windows the
+  month's sum scans every success row since the month began, which on a busy
+  site is too much to run before every provider call. The sum is kept in the
+  module's ETS flags table, keyed by the month's start (a new month, or another
+  `time_zone`, never reuses it), for `config :phoenix_kit_ai,
+  budget_month_cache_ttl: 30_000` milliseconds (`0` = off; the test config sets
+  it to `0`). A failed read is never cached. This is one more reason a cap is
+  a brake and not an invoice ceiling: spend can pass the monthly cap by up to
+  30 seconds of calls on top of the in-flight ones. `status/2` reads through
+  the same cache.
 - **Reached means stopped.** `remaining <= 0` refuses; a cap of exactly
   the amount spent is not room for one more call.
 - **Cached answers are refused too.** A cap is a stop switch: once spent,
@@ -63,15 +75,20 @@ Semantics, in order of how often they surprise:
   `task`), so the journal shows who was turned away; it counts toward no
   cap and no usage sink (`handle_ai_usage/1`) receives it. It is also a
   `limit_reached` guard event (scope `budget:<scope>`), and the guard's
-  watchers are told once per local day (`PhoenixKitAI.GuardEvents`).
+  watchers are told once per local day (`PhoenixKitAI.GuardEvents`); for the
+  monthly cap once per local month, since it only lifts when the month turns
+  (or the cap is raised).
 - **Task limits come first.** A call that names a declared task is checked
   against the task's calendar-day and month limits (`PhoenixKitAI.TaskLimits`)
-  before the caps; the caps stay the site-wide rolling-24-hour safety net.
+  before the caps; the caps stay the site-wide safety net (the rolling 24 hours, and the calendar
+  month for `ai_monthly_cap`).
 - **No reservation.** The check reads the table; concurrent callers can
   overshoot by their in-flight calls. Atomic reservation is a TODO.
 - **Fails open.** A database error reads as zero spend and no cap, so a
   blip does not refuse every call. The panel split on this; availability
-  won, and the module logs the failure.
+  won, and the module logs a warning naming the exception class, once per
+  node and class, so the first failure is visible without a flood while the
+  database is down.
 - **Warnings fire from `check/2` only.** `status/2` is pure so a dashboard
   polling it does not consume the once-per-crossing warning. The flags
   live in a small ETS table (never `persistent_term`, whose writes are a
@@ -92,6 +109,9 @@ Core's requests table carries single-column indexes on `inserted_at`,
 `endpoint_uuid`, `user_uuid` and `status`. The trailing-24-hour sums use
 `inserted_at` and filter the rest; a busy install with per-endpoint caps
 will want `(endpoint_uuid, inserted_at) WHERE status = 'success'` in core.
+The monthly sum is the same `inserted_at` range over a longer window, so no
+index makes it cheap (it is an aggregate over the month's rows): that is why
+it is cached for 30 seconds.
 
 ## Request cache (`PhoenixKitAI.RequestCache`)
 
