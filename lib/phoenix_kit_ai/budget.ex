@@ -1,17 +1,27 @@
 defmodule PhoenixKitAI.Budget do
   @moduledoc """
-  Spend caps over the trailing 24 hours, checked before every provider call.
+  Spend caps over the trailing 24 hours and the current calendar month,
+  checked before every provider call.
 
   Usage rows already carry cost, endpoint and user; a cap is a sum over
-  the trailing day plus a refusal. Three scopes, each a module setting in US
+  a window plus a refusal. Four scopes, each a module setting in US
   dollars (a decimal string, `"5"` or `"0.10"`) where `0` or blank means no
   cap; the usage rows' `cost` is summed and compared as it is:
 
-  | setting | scope |
-  |---|---|
-  | `ai_daily_cap` | every call the module makes |
-  | `ai_daily_cap_per_endpoint` | calls on one endpoint |
-  | `ai_daily_cap_per_user` | calls attributed to a `user_uuid:` |
+  | setting | scope | window |
+  |---|---|---|
+  | `ai_daily_cap` | every call the module makes (`:global`) | trailing 24 hours |
+  | `ai_monthly_cap` | every call the module makes (`:global_month`) | calendar month |
+  | `ai_daily_cap_per_endpoint` | calls on one endpoint (`:endpoint`) | trailing 24 hours |
+  | `ai_daily_cap_per_user` | calls attributed to a `user_uuid:` (`:user`) | trailing 24 hours |
+
+  The monthly cap is the same sum as the global daily one over a longer
+  window: from the local midnight that starts the current month to now, in
+  the site time zone (Settings → `time_zone`; the month window of
+  `PhoenixKitAI.TaskLimits.windows/1`). It is calendar, not rolling: it
+  starts again at zero on the first of the month. Both site-wide caps can
+  be set together ("$8 a day, $100 a month"); whichever is reached first
+  refuses.
 
   The released versions kept these caps under `ai_daily_budget*` in integer
   millionths of a dollar (`"5000000"` was $5). The module's migration chain
@@ -43,8 +53,8 @@ defmodule PhoenixKitAI.Budget do
   Once a cap is reached every verb returns `{:error, {:budget_exceeded,
   scope}}` without a provider call — cached answers included: a cap is a
   stop switch, so a runaway site goes quiet rather than half-quiet. The
-  window is rolling, not a calendar day: spend from 23:00 still counts at
-  09:00. The check reads the usage table; there is no reservation, so
+  daily windows are rolling, not a calendar day: spend from 23:00 still
+  counts at 09:00. The check reads the usage table; there is no reservation, so
   concurrent callers can overshoot by their in-flight calls. It also fails
   open — a database error reads as zero spend and no cap — because the
   module would otherwise refuse everything on a blip.
@@ -62,16 +72,18 @@ defmodule PhoenixKitAI.Budget do
 
   alias PhoenixKitAI.{Endpoint, Money, Request}
 
-  @scopes [:global, :endpoint, :user, :user_calls]
-  @money_scopes [:global, :endpoint, :user]
+  @scopes [:global, :global_month, :endpoint, :user, :user_calls]
+  @money_scopes [:global, :global_month, :endpoint, :user]
   @user_scopes [:user, :user_calls]
   @settings %{
     global: "ai_daily_cap",
+    global_month: "ai_monthly_cap",
     endpoint: "ai_daily_cap_per_endpoint",
     user: "ai_daily_cap_per_user",
     user_calls: "ai_daily_calls_per_user"
   }
-  # The released versions' money caps, integer millionths of a dollar.
+  # The released versions' money caps, integer millionths of a dollar. The
+  # monthly cap is newer than the move to dollars and has no old key.
   @legacy_settings %{
     global: "ai_daily_budget",
     endpoint: "ai_daily_budget_per_endpoint",
@@ -81,7 +93,7 @@ defmodule PhoenixKitAI.Budget do
   @default_warn_percent 80
   @window_seconds 24 * 60 * 60
 
-  @type scope :: :global | :endpoint | :user | :user_calls
+  @type scope :: :global | :global_month | :endpoint | :user | :user_calls
   @typedoc "Dollars (a `Decimal`) for a money scope, a call count for `:user_calls`."
   @type amount :: Decimal.t() | non_neg_integer()
   @type status :: %{
@@ -287,10 +299,10 @@ defmodule PhoenixKitAI.Budget do
     _ -> :ok
   end
 
-  # Dollars spent in the trailing window (a nil cost counts as zero), or for
+  # Dollars spent in the scope's window (a nil cost counts as zero), or for
   # :user_calls the number of calls.
   defp spent(scope, endpoint, user_uuid) do
-    since = DateTime.add(DateTime.utc_now(), -@window_seconds, :second)
+    since = window_start(scope)
 
     if scope == :user_calls,
       do: calls(since, user_uuid),
@@ -300,6 +312,13 @@ defmodule PhoenixKitAI.Budget do
   catch
     :exit, _ -> if scope == :user_calls, do: 0, else: Decimal.new(0)
   end
+
+  # The monthly cap counts from the start of the site's calendar month, the
+  # window `TaskLimits` uses; the others look at the trailing 24 hours.
+  defp window_start(:global_month),
+    do: PhoenixKitAI.TaskLimits.windows().month |> elem(0)
+
+  defp window_start(_scope), do: DateTime.add(DateTime.utc_now(), -@window_seconds, :second)
 
   # Successful calls only, like the money sum: a failed call costs nothing
   # and is not the user's doing. Same literal status, same partial index.
@@ -325,7 +344,7 @@ defmodule PhoenixKitAI.Budget do
 
     query =
       case scope do
-        :global -> query
+        scope when scope in [:global, :global_month] -> query
         :endpoint -> where(query, [r], r.endpoint_uuid == ^endpoint.uuid)
         :user -> where(query, [r], r.user_uuid == ^user_uuid)
       end
@@ -334,7 +353,7 @@ defmodule PhoenixKitAI.Budget do
   end
 
   # Warn once per crossing: the flag is an ETS row per scope key and clears
-  # when spend drops back under the line (a new day).
+  # when spend drops back under the line (a new day, or month).
   defp maybe_warn(%{spent: spent, limit: limit, scope: scope}, endpoint, user_uuid) do
     table = PhoenixKitAI.RequestCache.flags_table()
     key = {__MODULE__, scope, scope_id(scope, endpoint, user_uuid)}
@@ -347,7 +366,8 @@ defmodule PhoenixKitAI.Budget do
         :ets.insert(table, {key, true})
 
         Logger.warning(
-          "[PhoenixKitAI] budget #{scope} at #{percent}% (#{show(spent)} of #{show(limit)} in 24h)"
+          "[PhoenixKitAI] budget #{scope} at #{percent}% " <>
+            "(#{show(spent)} of #{show(limit)} #{window_label(scope)})"
         )
 
         :telemetry.execute(
@@ -377,6 +397,9 @@ defmodule PhoenixKitAI.Budget do
 
   defp percent_of(spent, limit), do: div(spent * 100, max(limit, 1))
 
+  defp window_label(:global_month), do: "this month"
+  defp window_label(_scope), do: "in 24h"
+
   defp show(%Decimal{} = dollars), do: "$" <> Decimal.to_string(dollars, :normal)
   defp show(calls), do: "#{calls} calls"
 
@@ -384,6 +407,7 @@ defmodule PhoenixKitAI.Budget do
   defp measure(calls), do: calls
 
   defp scope_id(:global, _endpoint, _user), do: :all
+  defp scope_id(:global_month, _endpoint, _user), do: :all
   defp scope_id(:endpoint, endpoint, _user), do: endpoint.uuid
   defp scope_id(:user, _endpoint, user), do: user
   defp scope_id(:user_calls, _endpoint, user), do: user

@@ -743,6 +743,7 @@ defmodule PhoenixKitAI.GuardEvents do
   end
 
   defp budget_scope(:global), do: gettext("the whole site")
+  defp budget_scope(:global_month), do: gettext("the whole site, per month")
   defp budget_scope(:endpoint), do: gettext("one endpoint")
   defp budget_scope(:user), do: gettext("one user's spending")
   defp budget_scope(:user_calls), do: gettext("one user's calls")
