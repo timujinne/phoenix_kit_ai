@@ -246,7 +246,7 @@ Repo-local aliases:
   the site time zone's calendar month, scope `:global_month`) read the usage
   table; concurrent callers overshoot by their
   in-flight calls (the monthly sum also by up to 30 s of calls: it is cached),
-  and a database error fails open (logged once per node). Treat a cap as a brake
+  and a database error fails open (logged once per outage per node). Treat a cap as a brake
   on a runaway day, not as a hard invoice ceiling.
 - `PhoenixKitAI.Limiter` counts per node: in a cluster each node has its own slots,
   so a provider sees up to `limit × nodes` concurrent calls. The slot covers the whole

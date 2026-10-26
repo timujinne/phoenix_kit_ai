@@ -372,6 +372,42 @@ defmodule PhoenixKitAI.BudgetMonthlyTest do
       assert :ets.lookup(flags, {Budget, :read_failed, :all}) == []
     end
 
+    test "a month sum served from the cache leaves the flag set", %{endpoint: ep} do
+      Application.put_env(:phoenix_kit_ai, :budget_month_cache_ttl, 30_000)
+      on_exit(fn -> Application.put_env(:phoenix_kit_ai, :budget_month_cache_ttl, 0) end)
+      {:ok, _} = Budget.set_limit(:global_month, "1.00")
+      flags = RequestCache.flags_table()
+      key = {Budget, :read_failed, :all}
+
+      assert %{spent: _} = month_status(ep)
+      :ets.insert(flags, {key, true})
+
+      assert %{spent: _} = month_status(ep)
+      assert :ets.lookup(flags, key) == [{key, true}]
+
+      [{cache_key, _}] = :ets.match_object(flags, {{Budget, :month_spent, :_}, :_})
+      :ets.delete(flags, cache_key)
+
+      assert %{spent: _} = month_status(ep)
+      assert :ets.lookup(flags, key) == []
+    end
+
+    test "a new cache entry drops the entries of other month starts", %{endpoint: ep} do
+      Application.put_env(:phoenix_kit_ai, :budget_month_cache_ttl, 30_000)
+      on_exit(fn -> Application.put_env(:phoenix_kit_ai, :budget_month_cache_ttl, 0) end)
+      {:ok, _} = Budget.set_limit(:global_month, "1.00")
+      flags = RequestCache.flags_table()
+      stale = {Budget, :month_spent, ~U[2001-01-01 00:00:00Z]}
+      :ets.insert(flags, {stale, {Decimal.new(0), System.monotonic_time(:millisecond) + 60_000}})
+
+      assert %{spent: _} = month_status(ep)
+
+      assert [{{Budget, :month_spent, since}, _}] =
+               :ets.match_object(flags, {{Budget, :month_spent, :_}, :_})
+
+      refute since == ~U[2001-01-01 00:00:00Z]
+    end
+
     test "fails open and is logged once per node", %{endpoint: ep} do
       {:ok, _} = Budget.set_limit(:global_month, "1.00")
       {:ok, _} = Budget.set_limit(:global, "1.00")
