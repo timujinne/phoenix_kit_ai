@@ -63,7 +63,7 @@ defmodule PhoenixKitAI do
   - `schema:` / `json: true` on `ask/3`, `complete/3`, `describe_image/3` -
     a JSON answer; see `PhoenixKitAI.StructuredOutput`.
   - Every verb returns `{:error, {:budget_exceeded, scope}}` once a spend
-    cap is reached (`PhoenixKitAI.Budget`), cached answers included, and
+    cap (daily or monthly) is reached (`PhoenixKitAI.Budget`), cached answers included, and
     every usage row emits `[:phoenix_kit_ai, :request]`.
 
   ### Usage Tracking

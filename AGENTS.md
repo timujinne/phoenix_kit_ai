@@ -242,7 +242,9 @@ Repo-local aliases:
   an `endpoint_uuid` or `prompt_uuid` that names no row. Task limits read a
   `user_uuid:` that is not a uuid as no user: the task's own limits apply,
   the per-user ones do not. Cap the endpoint or the site for visitors.
-- Spend caps read the usage table; concurrent callers overshoot by their
+- Spend caps (`ai_daily_cap*` over the trailing 24 hours, `ai_monthly_cap` over
+  the site time zone's calendar month, scope `:global_month`) read the usage
+  table; concurrent callers overshoot by their
   in-flight calls, and a database error fails open. Treat a cap as a brake
   on a runaway day, not as a hard invoice ceiling.
 - `PhoenixKitAI.Limiter` counts per node: in a cluster each node has its own slots,

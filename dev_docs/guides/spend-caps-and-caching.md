@@ -24,6 +24,7 @@ counted in the wrong unit.
 | setting | scope |
 |---|---|
 | `ai_daily_cap` | every call the module makes |
+| `ai_monthly_cap` | every call the module makes, in the current calendar month of the site time zone (`:global_month`) |
 | `ai_daily_cap_per_endpoint` | one endpoint |
 | `ai_daily_cap_per_user` | one `user_uuid:` |
 | `ai_budget_warn_percent` | warn once per crossing (default 80) |
@@ -43,6 +44,13 @@ Semantics, in order of how often they surprise:
 
 - **Rolling window, not a calendar day.** Spend from 23:00 still counts at
   09:00; a row older than 24 hours drops out mid-morning and frees spend.
+- **The monthly cap is a calendar month.** `ai_monthly_cap` sums the same
+  success rows as the global daily cap from the local midnight that starts the
+  month (Settings → `time_zone`, the month window of
+  `PhoenixKitAI.TaskLimits.windows/1`) and starts again at zero on the first.
+  It refuses with `{:error, {:budget_exceeded, :global_month}}`; the daily and
+  monthly site caps can both be set and either refuses when reached. A
+  setting only: no migration.
 - **Reached means stopped.** `remaining <= 0` refuses; a cap of exactly
   the amount spent is not room for one more call.
 - **Cached answers are refused too.** A cap is a stop switch: once spent,
