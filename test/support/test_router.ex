@@ -21,6 +21,24 @@ defmodule PhoenixKitAI.Test.Router do
     plug(:protect_from_forgery)
   end
 
+  # Core's own scope hook, so a test can drive a permission change through
+  # the real refresh path (ScopeNotifier broadcast -> the hook -> the page's
+  # `phoenix_kit_scope_changed/1`). One route; the rest use the test hook.
+  scope "/core-scope" do
+    pipe_through(:browser)
+
+    live_session :ai_core_scope_test,
+      layout: {PhoenixKitAI.Test.Layouts, :app},
+      on_mount: [{PhoenixKitWeb.Users.Auth, :phoenix_kit_mount_current_scope}] do
+      live("/admin/ai/usage", PhoenixKitAI.Web.Endpoints, :usage, as: :core_scope_ai_usage)
+      live("/admin/ai/tasks", PhoenixKitAI.Web.Tasks, :index, as: :core_scope_ai_tasks)
+
+      live("/admin/ai/endpoints/new", PhoenixKitAI.Web.EndpointForm, :new,
+        as: :core_scope_ai_endpoint_new
+      )
+    end
+  end
+
   scope "/" do
     pipe_through(:browser)
 

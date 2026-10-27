@@ -587,8 +587,39 @@ defmodule PhoenixKitAI.Web.EndpointForm do
   # LIFECYCLE
   # ===========================================
 
+  @manage_endpoints "ai.manage_endpoints"
+
   @impl true
-  def mount(_params, session, socket) do
+  def mount(params, session, socket) do
+    # No tab names this page, so core's route gate admits any `ai` holder;
+    # creating or editing an endpoint needs ai.manage_endpoints.
+    if Access.can?(socket, @manage_endpoints) do
+      do_mount(params, session, socket)
+    else
+      {:ok,
+       socket
+       |> put_flash(:error, gettext("You don't have permission to manage AI endpoints."))
+       |> push_navigate(to: PhoenixKitAI.Routes.ai_path() <> "/endpoints")}
+    end
+  end
+
+  @doc "Closes the form when core revokes endpoint management, and refreshes its guard rights."
+  @spec phoenix_kit_scope_changed(Phoenix.LiveView.Socket.t()) :: Phoenix.LiveView.Socket.t()
+  def phoenix_kit_scope_changed(socket) do
+    if Access.can?(socket, @manage_endpoints) do
+      may_manage = Access.may_manage?(socket)
+
+      socket
+      |> assign(:may_price, may_manage)
+      |> assign(:may_declare, not Guard.verified_only?() or may_manage)
+    else
+      socket
+      |> put_flash(:error, gettext("You don't have permission to manage AI endpoints."))
+      |> push_navigate(to: PhoenixKitAI.Routes.ai_path() <> "/endpoints")
+    end
+  end
+
+  defp do_mount(_params, session, socket) do
     # No DB queries in mount/3 — they run twice. The `enabled?` check,
     # integration listing, and endpoint load all happen in
     # `handle_params/3`.
@@ -1158,6 +1189,15 @@ defmodule PhoenixKitAI.Web.EndpointForm do
 
   @impl true
   def handle_event("save", %{"endpoint" => params}, socket) do
+    if Access.can?(socket, @manage_endpoints) do
+      save(params, socket)
+    else
+      {:noreply,
+       put_flash(socket, :error, gettext("You don't have permission to manage AI endpoints."))}
+    end
+  end
+
+  defp save(params, socket) do
     case submitted_pricing(params) do
       refused when refused in [:error, :half] ->
         # The typed values stay in the fields; nothing is saved.
